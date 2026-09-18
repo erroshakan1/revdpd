@@ -101,3 +101,67 @@ def test_project_relative_paths(tmp_path):
     p = Project.load(pj)
     assert p.cg_path == str((tmp_path / "cg.data").resolve())
     assert p.out_dir == str((tmp_path / "sub" / "out").resolve())
+
+
+def _bent_target(m, mp, scale, rng):
+    """CG bead positions of a strongly bent version of the template (CG units)."""
+    B = bead_centers(m, mp)
+    T = B.copy()
+    # bend: rotate everything after bead 1 by 70 degrees about an axis through bead 1
+    from revdpd.core.backmap import rotation_about
+    Rb = rotation_about(np.array([0.0, 0.0, 1.0]), np.radians(70))
+    T[2:] = (B[2:] - B[1]) @ Rb.T + B[1]
+    R = random_rotation(rng)
+    return (T @ R.T + 3.0) / scale
+
+
+def test_fragment_mode_follows_bent_molecule(tmp_path):
+    m = parse_molecule(write_aa(tmp_path, n_c=12))
+    mp = auto_linear_mapping(m, 4)
+    bonds = [(0, 1), (1, 2), (2, 3)]
+    rng = np.random.default_rng(7)
+    x = _bent_target(m, mp, 4.0, rng)
+    rig = Fitter(m, mp, BackmapSettings(scale=4.0, random_spin=False), bonds)
+    frg = Fitter(m, mp, BackmapSettings(scale=4.0, random_spin=False, mode="fragment"), bonds)
+    r_rigid = rig.rmsd(x, rig.fit(x, rng))
+    y = frg.fit(x, rng)
+    r_frag = frg.rmsd(x, y)
+    assert r_frag < 0.35 * r_rigid, (r_rigid, r_frag)
+    # bonds inside a fragment keep their length
+    frag0 = np.flatnonzero(frg.owner == 0)
+    for a, b in m.bonds:
+        if a in frag0 and b in frag0:
+            assert abs(np.linalg.norm(y[a] - y[b]) - np.linalg.norm(m.pos[a] - m.pos[b])) < 1e-8
+
+
+def test_water_clusters(tmp_path):
+    from revdpd.core.backmap import backmap_species
+    from revdpd.io.moltemplate import parse_forcefield, spc_water
+    ff = parse_forcefield(write_aa(tmp_path).parent / "toyff.lt")
+    ff.masses["OW"] = 15.9994
+    ff.masses["H"] = 1.008
+    w = spc_water(ff)
+    assert np.isclose(w.charges.sum(), 0) and w.heavy_mask().sum() == 1
+    text, coords = cg_data("angle", n_mol=30, n_beads=1, box=10.0)
+    (tmp_path / "w.data").write_text(text)
+    cg = CGSystem(read_lammps_data(tmp_path / "w.data"))
+    sp = cg.species[0]
+    mp = BeadMapping(1, [[0]])
+    out, _, lin = backmap_species(cg, sp, w, mp, BackmapSettings(scale=4.0), copies=3)
+    assert len(out) == 90 and not lin.any()
+    for k in range(30):
+        cl = np.array([o[0] for o in out[3 * k:3 * k + 3]])       # oxygens of one bead
+        com = np.mean([o.mean(0) for o in out[3 * k:3 * k + 3]], axis=0)
+        assert np.linalg.norm(cl.mean(0) - cg.instance_coords(sp, k)[0] * 4.0) < 0.3
+        d = np.linalg.norm(cl[:, None] - cl[None], axis=-1)[np.triu_indices(3, 1)]
+        assert d.min() > 2.0
+        assert np.linalg.norm(com - cg.instance_coords(sp, k)[0] * 4.0) < 0.5
+
+
+def test_molid_zero_is_split_by_bonds(tmp_path):
+    text, _ = cg_data("angle", n_mol=5, n_beads=1)
+    lines = [ln if not (ln and ln[0].isdigit() and len(ln.split()) == 6) else
+             " ".join([ln.split()[0], "0"] + ln.split()[2:]) for ln in text.splitlines()]
+    (tmp_path / "z.data").write_text("\n".join(lines) + "\n")
+    cg = CGSystem(read_lammps_data(tmp_path / "z.data", "angle"), "molid")
+    assert cg.species[0].count == 5

@@ -9,7 +9,18 @@ import numpy as np
 
 from ..io.lammps_data import read_lammps_data
 from ..io.lammps_writer import MoleculeSet, OutputSettings, WriteResult, write_lammps
-from ..io.moltemplate import AAMolecule, parse_molecule
+from ..io.moltemplate import AAMolecule, parse_forcefield, parse_molecule, spc_water
+
+BUILTIN_SPC = "builtin:spc"
+
+
+def load_template(aa_path: str, ff_path: str | None) -> AAMolecule:
+    """Load an all-atom template (``builtin:spc`` = SPC water with the given force field)."""
+    if aa_path == BUILTIN_SPC:
+        if not ff_path:
+            raise ValueError("built-in SPC water needs a force-field file")
+        return spc_water(parse_forcefield(ff_path))
+    return parse_molecule(aa_path, ff_path)
 from .backmap import BackmapSettings, backmap_species
 from .cg_system import CGSpecies, CGSystem
 from .lammps_runner import find_lammps, run_lammps
@@ -27,6 +38,7 @@ class SpeciesAssignment:
     ff_path: str | None
     mapping: dict                    # BeadMapping.to_dict()
     enabled: bool = True
+    copies_per_bead: int = 1         # >1: e.g. N_m water molecules per DPD water bead
 
 
 @dataclass
@@ -73,7 +85,8 @@ class Project:
 
         d["cg_path"] = rel(d["cg_path"])
         for a in d.get("assignments", []):
-            a["aa_path"] = rel(a["aa_path"])
+            if a["aa_path"] != BUILTIN_SPC:
+                a["aa_path"] = rel(a["aa_path"])
             a["ff_path"] = rel(a.get("ff_path"))
         if "out_dir" in d:
             d["out_dir"] = rel(d["out_dir"])
@@ -105,21 +118,38 @@ class BackmapResult:
     lammps_exit: int | None = None
 
 
-def run_backmapping(cg: CGSystem, jobs: list[tuple[CGSpecies, AAMolecule, BeadMapping]],
-                    bm: BackmapSettings, ov: OverlapSettings, outset: OutputSettings,
-                    out_dir: str | Path, mini: MinimizeSettings | None = None,
+@dataclass
+class Job:
+    species: CGSpecies
+    mol: AAMolecule
+    mapping: BeadMapping
+    copies: int = 1
+
+
+def run_backmapping(cg: CGSystem, jobs: list, bm: BackmapSettings, ov: OverlapSettings,
+                    outset: OutputSettings, out_dir: str | Path, mini: MinimizeSettings | None = None,
                     log=print, progress=None, stop=None) -> BackmapResult:
+    """``jobs``: :class:`Job` objects or (species, molecule, mapping[, copies]) tuples."""
+    jobs = [j if isinstance(j, Job) else Job(*j) for j in jobs]
+    # molecules placed one per CG molecule are restrained and written first; solvent last
+    jobs.sort(key=lambda j: j.copies > 1)
     rng = np.random.default_rng(bm.seed)
     sets: list[MoleculeSet] = []
     rmsd: dict[str, float] = {}
     spin_flags: list[bool] = []
-    for sp, mol, mapping in jobs:
-        log(f"fitting {mol.name} onto {sp.count} x {sp.name}")
-        coords, r, lin = backmap_species(cg, sp, mol, mapping, bm, rng,
-                                    progress=(lambda i, n: progress(sp.name, i, n)) if progress else None)
-        rmsd[sp.name] = float(r.mean())
-        log(f"  bead-centre RMSD after fit: mean {r.mean():.2f} A, max {r.max():.2f} A")
-        sets.append(MoleculeSet(mol, coords))
+    for j in jobs:
+        sp, mol = j.species, j.mol
+        if j.copies > 1:
+            log(f"placing {j.copies} x {mol.name} per bead on {sp.count} x {sp.name}")
+        else:
+            log(f"fitting {mol.name} onto {sp.count} x {sp.name} ({bm.mode} fit)")
+        coords, r, lin = backmap_species(cg, sp, mol, j.mapping, bm, rng, copies=j.copies,
+                                         progress=(lambda i, n, name=sp.name: progress(name, i, n))
+                                         if progress else None)
+        if j.copies == 1:
+            rmsd[sp.name] = float(r.mean())
+            log(f"  bead-centre RMSD after fit: mean {r.mean():.2f} A, max {r.max():.2f} A")
+        sets.append(MoleculeSet(mol, coords, restrain=j.copies == 1))
         spin_flags += lin.tolist()
 
     box = cg.box.scaled(bm.scale)
@@ -160,7 +190,7 @@ def run_project(project: Project, log=print) -> BackmapResult:
         if not a.enabled:
             continue
         sp = resolve_species(cg, a)
-        mol = parse_molecule(a.aa_path, a.ff_path)
-        jobs.append((sp, mol, BeadMapping.from_dict(a.mapping, mol)))
+        mol = load_template(a.aa_path, a.ff_path)
+        jobs.append(Job(sp, mol, BeadMapping.from_dict(a.mapping, mol), a.copies_per_bead))
     return run_backmapping(cg, jobs, project.backmap, project.overlap, project.output,
                            project.out_dir, project.minimize, log=log)

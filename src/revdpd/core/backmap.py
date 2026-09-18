@@ -13,7 +13,7 @@ from .mapping import BeadMapping, atom_owners, bead_centers
 @dataclass
 class BackmapSettings:
     scale: float = 10.0            # Angstrom per CG length unit
-    mode: str = "rigid"            # "rigid" | "flex"
+    mode: str = "rigid"            # "rigid" | "flex" | "fragment"
     flex_weight: float = 1.0       # fraction of the per-bead residual applied in flex mode
     random_spin: bool = True       # randomise rotation about the axis of (near-)linear molecules
     linear_threshold: float = 0.15  # s2/s1 of bead centres below which a molecule counts as linear
@@ -85,10 +85,27 @@ def estimate_scale(cg: CGSystem, species: CGSpecies, mol: AAMolecule, mapping: B
     return float(np.mean(aa) / np.mean(cg_all))
 
 
-class Fitter:
-    """Places copies of an all-atom template onto CG molecule instances."""
+FIT_MODES = ("rigid", "flex", "fragment")
 
-    def __init__(self, mol: AAMolecule, mapping: BeadMapping, settings: BackmapSettings):
+
+class Fitter:
+    """Places copies of an all-atom template onto CG molecule instances.
+
+    Modes
+    -----
+    rigid
+        one Kabsch fit of all bead centres; the template geometry is kept exactly.
+    flex
+        rigid fit, then every atom is shifted by the residual of its bead.
+    fragment
+        rigid fit, then every bead's atom fragment is rotated separately so that the
+        directions to its bonded neighbour beads match the CG molecule, and centred on
+        its bead (per-fragment alignment in the spirit of CG2AT). Follows bent CG
+        conformations; bonds between fragments are repaired by the relaxation.
+    """
+
+    def __init__(self, mol: AAMolecule, mapping: BeadMapping, settings: BackmapSettings,
+                 cg_bonds: list[tuple[int, int]] | None = None):
         self.mol = mol
         self.mapping = mapping
         self.s = settings
@@ -98,17 +115,28 @@ class Fitter:
         self.B = bead_centers(mol, mapping)
         self.owner = atom_owners(mol, mapping)
         self.linear = is_linear(self.B[self.mapped], settings.linear_threshold)
+        mapped = set(self.mapped.tolist())
+        self.nbr: dict[int, list[int]] = {int(k): [] for k in self.mapped}
+        for i, j in cg_bonds or []:
+            if i in mapped and j in mapped:
+                self.nbr[i].append(j)
+                self.nbr[j].append(i)
+        # second neighbours help when a bead has a single bonded neighbour
+        self.nbr2: dict[int, list[int]] = {}
+        for k, nb in self.nbr.items():
+            second = {m for j in nb for m in self.nbr[j]} - set(nb) - {k}
+            self.nbr2[k] = sorted(second)
+        self.frag = {int(k): np.flatnonzero(self.owner == k) for k in self.mapped}
 
     def instance_is_linear(self, cg_coords: np.ndarray) -> bool:
         """True when the spin about the long axis is undetermined for this instance."""
         return (self.linear or len(self.mapped) <= 2
                 or is_linear(cg_coords[self.mapped], self.s.linear_threshold))
 
-    def fit(self, cg_coords: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        """All-atom coordinates (Angstrom) for one CG instance (CG units, unwrapped)."""
+    def global_fit(self, cg_coords: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+        """Rotation and translation of the whole template (including the random spin)."""
         T = cg_coords[self.mapped] * self.s.scale
         P = self.B[self.mapped]
-        X = self.mol.pos
         if len(self.mapped) == 1:
             R = random_rotation(rng)
             t = T[0] - R @ P[0]
@@ -117,25 +145,92 @@ class Fitter:
             t = T.mean(0) - R @ P.mean(0)
         else:
             R, t = kabsch(P, T)
-        Y = X @ R.T + t
-        fitted_centers = self.B @ R.T + t
-        if self.s.random_spin and self.instance_is_linear(cg_coords):
-            axis, _ = principal_axis(T) if len(T) >= 2 else (np.array([0, 0, 1.0]), None)
+        if self.s.random_spin and self.instance_is_linear(cg_coords) and len(T) >= 2:
+            axis, _ = principal_axis(T)
             c = T.mean(0)
             Rs = rotation_about(axis, rng.uniform(0, 2 * np.pi))
-            Y = (Y - c) @ Rs.T + c
-            fitted_centers = (fitted_centers - c) @ Rs.T + c
+            R = Rs @ R
+            t = Rs @ (t - c) + c
+        return R, t
+
+    def fit(self, cg_coords: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """All-atom coordinates (Angstrom) for one CG instance (CG units, unwrapped)."""
+        R, t = self.global_fit(cg_coords, rng)
+        Y = self.mol.pos @ R.T + t
+        Tall = cg_coords * self.s.scale
         if self.s.mode == "flex":
+            fitted = self.B @ R.T + t
             resid = np.zeros((self.mapping.n_beads, 3))
-            resid[self.mapped] = T - fitted_centers[self.mapped]
+            resid[self.mapped] = Tall[self.mapped] - fitted[self.mapped]
             ok = self.owner >= 0
             Y[ok] += self.s.flex_weight * resid[self.owner[ok]]
+        elif self.s.mode == "fragment":
+            for k, atoms in self.frag.items():
+                if len(atoms) == 0:
+                    continue
+                Q = self._local_rotation(k, R, Tall)
+                Y[atoms] = (self.mol.pos[atoms] - self.B[k]) @ (Q @ R).T + Tall[k]
         return Y
+
+    def _local_rotation(self, k: int, R: np.ndarray, T: np.ndarray) -> np.ndarray:
+        """Extra rotation for fragment ``k`` mapping template neighbour directions onto CG ones."""
+        nb = self.nbr[k]
+        if len(nb) < 2:
+            nb = nb + self.nbr2[k][:2]
+        if not nb:
+            return np.eye(3)
+        U = (self.B[nb] - self.B[k]) @ R.T          # template directions after the global fit
+        V = T[nb] - T[k]                            # CG directions
+        U /= np.linalg.norm(U, axis=1)[:, None]
+        V /= np.linalg.norm(V, axis=1)[:, None]
+        if len(nb) >= 2:
+            _, s, _ = np.linalg.svd(U)
+            if s[1] > 0.15 * s[0]:
+                H = U.T @ V
+                Us, _, Vt = np.linalg.svd(H)
+                d = np.sign(np.linalg.det(Vt.T @ Us.T)) or 1.0
+                return Vt.T @ np.diag([1.0, 1.0, d]) @ Us.T
+        # (nearly) collinear neighbours: smallest rotation aligning the mean direction
+        sign = np.sign(U @ U[0])[:, None]
+        return _align_vectors((U * sign).sum(0), (V * sign).sum(0))
 
     def rmsd(self, cg_coords: np.ndarray, aa_coords: np.ndarray) -> float:
         T = cg_coords[self.mapped] * self.s.scale
         C = bead_centers(self.mol, self.mapping, aa_coords)[self.mapped]
         return float(np.sqrt(((C - T) ** 2).sum(1).mean()))
+
+
+def molecular_volume(mol: AAMolecule) -> float:
+    """Volume (A^3) of one molecule at a mass density of 1 g/cm^3 (29.9 A^3 for water)."""
+    return float(mol.masses.sum() / 0.60221)
+
+
+def place_cluster(center: np.ndarray, mol: AAMolecule, n: int, rng: np.random.Generator,
+                  d_min: float = 2.6, max_tries: int = 2000) -> list[np.ndarray]:
+    """``n`` randomly oriented copies of a small molecule packed around ``center`` (A).
+
+    Used for CG beads that represent several molecules (e.g. a DPD water bead with
+    N_m water molecules). Molecule centres are drawn uniformly in a sphere whose volume
+    equals ``n`` molecular volumes, keeping centres at least ``d_min`` apart when possible.
+    """
+    com = (mol.pos * mol.masses[:, None]).sum(0) / mol.masses.sum()
+    radius = (3 * n * molecular_volume(mol) / (4 * np.pi)) ** (1 / 3)
+    centres: list[np.ndarray] = []
+    tries = 0
+    while len(centres) < n:
+        p = rng.normal(size=3)
+        p *= radius * rng.uniform() ** (1 / 3) / np.linalg.norm(p)
+        tries += 1
+        if tries < max_tries and any(np.linalg.norm(p - c) < d_min for c in centres):
+            continue
+        centres.append(p)
+    # keep the cluster centred exactly on the bead
+    cm = np.mean(centres, axis=0)
+    out = []
+    for c in centres:
+        R = random_rotation(rng)
+        out.append((mol.pos - com) @ R.T + center + c - cm)
+    return out
 
 
 def _align_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -156,17 +251,30 @@ def _align_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def backmap_species(cg: CGSystem, species: CGSpecies, mol: AAMolecule, mapping: BeadMapping,
                     settings: BackmapSettings, rng: np.random.Generator | None = None,
-                    progress=None) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+                    progress=None, copies: int = 1) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Fit the template onto every instance.
 
-    Returns (coords per molecule, bead RMSD per molecule, linear flag per molecule).
+    ``copies`` > 1 is allowed for single-bead species only: every bead is replaced by
+    that many molecules (e.g. N_m water molecules per DPD water bead).
+
+    Returns (coords per all-atom molecule, bead RMSD per CG molecule, linear flag per
+    all-atom molecule).
     """
     if mapping.n_beads != species.n_beads:
         raise ValueError(f"mapping has {mapping.n_beads} beads but species has {species.n_beads}")
+    if copies > 1 and species.n_beads != 1:
+        raise ValueError("several molecules per bead are only supported for single-bead species")
     rng = rng or np.random.default_rng(settings.seed)
-    fitter = Fitter(mol, mapping, settings)
-    out, rmsd, lin = [], [], []
     n = species.count
+    out, rmsd, lin = [], [], []
+    if copies > 1:
+        for k in range(n):
+            x = cg.instance_coords(species, k)[0] * settings.scale
+            out += place_cluster(x, mol, copies, rng)
+            if progress and (k % 500 == 0 or k == n - 1):
+                progress(k + 1, n)
+        return out, np.zeros(n), np.zeros(len(out), dtype=bool)
+    fitter = Fitter(mol, mapping, settings, species.bonds)
     for k in range(n):
         x = cg.instance_coords(species, k)
         y = fitter.fit(x, rng)

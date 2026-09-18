@@ -16,16 +16,17 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..core.backmap import BackmapSettings, Fitter, estimate_scale
+from ..core.backmap import BackmapSettings, Fitter, estimate_scale, place_cluster
 from ..core.cg_system import CGSystem
 from ..core.lammps_runner import find_lammps
 from ..core.mapping import BeadMapping, atom_owners, auto_linear_mapping, reverse_mapping
 from ..core.pipeline import (
-    MinimizeSettings, OverlapSettings, Project, SpeciesAssignment, resolve_species, run_backmapping,
+    BUILTIN_SPC, Job, MinimizeSettings, OverlapSettings, Project, SpeciesAssignment, load_template,
+    resolve_species, run_backmapping,
 )
 from ..io.lammps_data import read_lammps_data
 from ..io.lammps_writer import OutputSettings
-from ..io.moltemplate import AAMolecule, parse_molecule
+from ..io.moltemplate import AAMolecule, parse_forcefield, parse_molecule, spc_water
 from .mol_view import MoleculeView
 
 BEAD_COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6",
@@ -49,7 +50,13 @@ Hydrogens follow the heavy atom they are bonded to.
 template with CG bond lengths. Tick <i>Overlay fit</i> to preview the fitted molecule.</li>
 <li><b>Run</b>: every mapped species is fitted onto all its CG molecules (Kabsch fit of the bead
 centres - the orientation of every molecule is kept), optional rigid-body overlap removal,
-LAMMPS files are written, and optionally minimised with LAMMPS.</li>
+LAMMPS files are written together with a restrained, gradual relaxation script
+(bonded-only minimisation, soft push-off, minimisations with decreasing position restraints,
+restrained MD with increasing time step, final unrestrained minimisation), which can be run
+directly.</li>
+<li><b>Solvent</b>: a single-bead species (e.g. DPD water) can be replaced by N_m molecules per
+bead (<i>Molecules per bead</i>); <i>Built-in SPC water</i> provides a water template.
+Alternatively untick the solvent species and solvate the all-atom system afterwards.</li>
 </ol>
 <h3>Mouse</h3>
 Left drag: rotate &nbsp; Ctrl+left drag: roll &nbsp; Right/middle drag: pan &nbsp;
@@ -63,6 +70,7 @@ class SpeciesState:
     aa_path: str = ""
     ff_path: str = ""
     enabled: bool = True
+    copies: int = 1
 
 
 class Worker(QObject):
@@ -209,7 +217,17 @@ class MainWindow(QMainWindow):
         f2.addRow("Force field", _hline(self.ed_ff, b))
         self.btn_load_aa = QPushButton("Load for selected species")
         self.btn_load_aa.clicked.connect(self.load_aa)
-        f2.addRow(self.btn_load_aa)
+        self.btn_water = QPushButton("Built-in SPC water")
+        self.btn_water.setToolTip("Use an SPC water molecule with the OW/H atom types of the force field\n"
+                                  "(GROMOS/ATB). For single-bead solvent species.")
+        self.btn_water.clicked.connect(self.load_builtin_water)
+        f2.addRow(_hline(self.btn_load_aa, self.btn_water))
+        self.spn_copies = QSpinBox()
+        self.spn_copies.setRange(1, 100)
+        self.spn_copies.setToolTip("Number of all-atom molecules represented by one CG bead (N_m).\n"
+                                   "Only for single-bead species, e.g. 3 for a DPD water bead with N_m = 3.")
+        self.spn_copies.valueChanged.connect(self.on_copies_changed)
+        f2.addRow("Molecules per bead (N_m)", self.spn_copies)
         self.lbl_aa_info = QLabel("")
         self.lbl_aa_info.setWordWrap(True)
         f2.addRow(self.lbl_aa_info)
@@ -276,9 +294,12 @@ class MainWindow(QMainWindow):
         self.btn_est.clicked.connect(self.estimate_scale)
         f4.addRow("Scale", _hline(self.spn_scale, self.btn_est))
         self.cmb_mode = QComboBox()
-        self.cmb_mode.addItems(["rigid", "rigid + per-bead shift"])
-        self.cmb_mode.setToolTip("rigid: keep the template geometry.\n"
-                                 "per-bead shift: additionally move each atom group onto its bead.")
+        self.cmb_mode.addItems(["rigid", "rigid + per-bead shift", "per-bead fragments"])
+        self.cmb_mode.setToolTip(
+            "rigid: one fit of the whole template; its geometry is kept exactly.\n"
+            "per-bead shift: additionally translate each atom group onto its bead.\n"
+            "per-bead fragments: rotate each bead's atom group towards its neighbour beads and\n"
+            "centre it on the bead (follows bent CG molecules; relaxation repairs the joints).")
         f4.addRow("Fit", self.cmb_mode)
         self.spn_flex = QDoubleSpinBox()
         self.spn_flex.setRange(0, 1)
@@ -332,7 +353,7 @@ class MainWindow(QMainWindow):
         f6.addRow(self.chk_long)
         R.addWidget(g6)
 
-        self.g_min = QGroupBox("Energy minimisation with LAMMPS")
+        self.g_min = QGroupBox("Run relaxation with LAMMPS")
         self.g_min.setCheckable(True)
         self.g_min.setChecked(False)
         f7 = QFormLayout(self.g_min)
@@ -344,14 +365,43 @@ class MainWindow(QMainWindow):
         self.spn_mpi = QSpinBox()
         self.spn_mpi.setRange(1, 1024)
         f7.addRow("MPI ranks", self.spn_mpi)
-        self.chk_soft = QCheckBox("Soft-potential push-off first")
+        R.addWidget(self.g_min)
+
+        g8 = QGroupBox("Relaxation protocol (written to *.min.in)")
+        f8 = QFormLayout(g8)
+        self.chk_bonded = QCheckBox("1. Bonded-only minimisation")
+        self.chk_bonded.setChecked(True)
+        f8.addRow(self.chk_bonded)
+        self.chk_soft = QCheckBox("2. Soft-potential push-off")
         self.chk_soft.setChecked(True)
-        f7.addRow(self.chk_soft)
+        f8.addRow(self.chk_soft)
+        self.chk_restr = QCheckBox("Restrain heavy atoms to back-mapped positions")
+        self.chk_restr.setChecked(True)
+        f8.addRow(self.chk_restr)
+        self.ed_k = QLineEdit("1000 100 10")
+        self.ed_k.setToolTip("3. One full-force-field minimisation per restraint constant (kcal/mol/A^2)")
+        f8.addRow("3. Restraint k", self.ed_k)
+        self.spn_md = QSpinBox()
+        self.spn_md.setRange(0, 10**7)
+        self.spn_md.setValue(1000)
+        self.spn_md.setToolTip("4. Restrained MD steps per time step value (0 = no MD)")
+        f8.addRow("4. MD steps / stage", self.spn_md)
+        self.ed_dt = QLineEdit("0.2 0.5 1.0")
+        self.ed_dt.setToolTip("Time steps (fs) of the successive restrained MD stages")
+        f8.addRow("    Time steps (fs)", self.ed_dt)
+        self.spn_temp = QDoubleSpinBox()
+        self.spn_temp.setRange(1, 2000)
+        self.spn_temp.setValue(300)
+        self.spn_temp.setSuffix(" K")
+        f8.addRow("    Temperature", self.spn_temp)
+        self.chk_release = QCheckBox("5. Final minimisation without restraints")
+        self.chk_release.setChecked(True)
+        f8.addRow(self.chk_release)
         self.spn_steps = QSpinBox()
         self.spn_steps.setRange(10, 10**7)
         self.spn_steps.setValue(5000)
-        f7.addRow("Max. iterations", self.spn_steps)
-        R.addWidget(self.g_min)
+        f8.addRow("Max. min. iterations", self.spn_steps)
+        R.addWidget(g8)
 
         self.btn_run = QPushButton("Back-map system")
         self.btn_run.setMinimumHeight(36)
@@ -474,8 +524,9 @@ class MainWindow(QMainWindow):
         return None if (self.cg is None or self.cur is None) else self.cg.species[self.cur]
 
     def _set_species_widgets_enabled(self, on: bool):
-        for w in (self.ed_aa, self.ed_ff, self.btn_load_aa):
+        for w in (self.ed_aa, self.ed_ff, self.btn_load_aa, self.btn_water):
             w.setEnabled(on)
+        self.spn_copies.setEnabled(on and self.species is not None and self.species.n_beads == 1)
         self._set_mapping_widgets_enabled(on and self.state is not None and self.state.aa is not None)
 
     def _set_mapping_widgets_enabled(self, on: bool):
@@ -486,7 +537,7 @@ class MainWindow(QMainWindow):
     def backmap_settings(self, random_spin=None) -> BackmapSettings:
         return BackmapSettings(
             scale=self.spn_scale.value(),
-            mode="flex" if self.cmb_mode.currentIndex() == 1 else "rigid",
+            mode=("rigid", "flex", "fragment")[self.cmb_mode.currentIndex()],
             flex_weight=self.spn_flex.value(),
             random_spin=self.chk_spin.isChecked() if random_spin is None else random_spin,
             seed=self.spn_seed.value(),
@@ -582,6 +633,8 @@ class MainWindow(QMainWindow):
         if st is None or st.aa is None:
             return "-"
         n = len(st.mapping.mapped_beads()) if st.mapping else 0
+        if st.copies > 1:
+            return f"{st.copies} x {st.aa.name} per bead"
         return f"{st.aa.name} ({n}/{st.mapping.n_beads} mapped)"
 
     def _update_species_row(self, i: int):
@@ -604,6 +657,9 @@ class MainWindow(QMainWindow):
         self.active_bead = 0
         self.ed_aa.setText(st.aa_path)
         self.ed_ff.setText(st.ff_path)
+        self.spn_copies.blockSignals(True)
+        self.spn_copies.setValue(st.copies)
+        self.spn_copies.blockSignals(False)
         self.spn_instance.blockSignals(True)
         self.spn_instance.setMaximum(sp.count)
         self.spn_instance.setValue(1)
@@ -641,6 +697,8 @@ class MainWindow(QMainWindow):
         self.ed_ff.setText(st.ff_path)
         sp = self.species
         st.mapping = BeadMapping(n_beads=sp.n_beads, center=self._center_mode())
+        if sp.n_beads == 1:
+            st.mapping.assign(0, np.flatnonzero(mol.heavy_mask()).tolist())
         self.active_bead = 0
         self.log(f"loaded all-atom template {mol.name} from {path}: {mol.n_atoms} atoms "
                  f"({int(mol.heavy_mask().sum())} heavy), total charge {mol.charges.sum():+.3f}, "
@@ -649,6 +707,40 @@ class MainWindow(QMainWindow):
         self._update_species_row(self.cur)
         self._set_mapping_widgets_enabled(True)
         self.refresh_all(reset=True)
+
+    def load_builtin_water(self):
+        if self.cur is None:
+            return
+        ff_path = self.ed_ff.text().strip()
+        if not ff_path:
+            ff_path = next((st.ff_path for st in self.states.values() if st.ff_path), "")
+        if not ff_path:
+            self.error("Force field needed", "Select the force-field .lt file (step 2) or load another "
+                                             "species' template first; water uses its OW/H atom types.")
+            return
+        try:
+            mol = spc_water(parse_forcefield(ff_path))
+        except Exception as exc:  # noqa: BLE001
+            self.error("Cannot build SPC water", str(exc))
+            return
+        st, sp = self.state, self.species
+        st.aa, st.aa_path, st.ff_path = mol, BUILTIN_SPC, ff_path
+        st.mapping = BeadMapping(n_beads=sp.n_beads, center=self._center_mode())
+        if sp.n_beads == 1:
+            st.mapping.assign(0, [0])
+        self.ed_aa.setText(BUILTIN_SPC)
+        self.ed_ff.setText(ff_path)
+        self.log(f"built-in SPC water (types OW/H of {mol.ff.name}) assigned to {sp.name}")
+        self._update_aa_info()
+        self._update_species_row(self.cur)
+        self._set_mapping_widgets_enabled(True)
+        self.refresh_all(reset=True)
+
+    def on_copies_changed(self, v: int):
+        if self.state is not None:
+            self.state.copies = int(v)
+            self._update_species_row(self.cur)
+            self.refresh_cg(reset=False)
 
     def _update_aa_info(self):
         st = self.state
@@ -843,7 +935,7 @@ class MainWindow(QMainWindow):
         r = 0.32 * (bl if np.isfinite(bl) else 0.5)   # view works in DPD length units
         st = self.state
         overlay = bool(self.chk_overlay.isChecked() and st and st.aa and st.mapping
-                       and len(st.mapping.mapped_beads()) >= 2)
+                       and (len(st.mapping.mapped_beads()) >= 2 or st.copies > 1))
         cols = []
         for b in range(sp.n_beads):
             c = QColor(BEAD_COLORS[b % len(BEAD_COLORS)])
@@ -860,16 +952,28 @@ class MainWindow(QMainWindow):
         self.cg_view.set_rings({self.active_bead: QColor("#ffd400")})
         if overlay:
             try:
-                fitter = Fitter(st.aa, st.mapping, self.backmap_settings(random_spin=False))
-                y = fitter.fit(x, np.random.default_rng(0))
-                heavy = np.flatnonzero(st.aa.heavy_mask())
-                idx = {a: j for j, a in enumerate(heavy)}
-                hb = [(idx[a], idx[b]) for a, b in st.aa.bonds if a in idx and b in idx]
                 cols = self._aa_colors(st.aa, st.mapping)
-                self.cg_view.set_overlay(y[heavy] / s, [cols[a] for a in heavy], hb, radius=0.35 / s)
-                rmsd = fitter.rmsd(x, y)
-                self.cg_view.set_info(f"{sp.name}   molecule {k + 1}/{sp.count}   "
-                                      f"bead-fit RMSD {rmsd:.2f} A")
+                if st.copies > 1 and sp.n_beads == 1:
+                    ys = place_cluster(x[0] * s, st.aa, st.copies, np.random.default_rng(k))
+                    pts, pc, pb = [], [], []
+                    for y in ys:
+                        off = len(pts)
+                        pts += list(y / s)
+                        pc += [QColor(ELEMENT_COLORS.get(e, "#b0b0b0")) for e in st.aa.elements]
+                        pb += [(off + a, off + b) for a, b in st.aa.bonds]
+                    self.cg_view.set_overlay(np.array(pts), pc, pb, radius=0.3 / s)
+                    self.cg_view.set_info(f"{sp.name}   bead {k + 1}/{sp.count}   "
+                                          f"{st.copies} x {st.aa.name}")
+                else:
+                    fitter = Fitter(st.aa, st.mapping, self.backmap_settings(random_spin=False), sp.bonds)
+                    y = fitter.fit(x, np.random.default_rng(0))
+                    heavy = np.flatnonzero(st.aa.heavy_mask())
+                    idx = {a: j for j, a in enumerate(heavy)}
+                    hb = [(idx[a], idx[b]) for a, b in st.aa.bonds if a in idx and b in idx]
+                    self.cg_view.set_overlay(y[heavy] / s, [cols[a] for a in heavy], hb, radius=0.35 / s)
+                    rmsd = fitter.rmsd(x, y)
+                    self.cg_view.set_info(f"{sp.name}   molecule {k + 1}/{sp.count}   "
+                                          f"bead-fit RMSD {rmsd:.2f} A")
             except Exception as exc:  # noqa: BLE001
                 self.cg_view.set_overlay(np.zeros((0, 3)), [], [])
                 self.statusBar().showMessage(f"overlay: {exc}")
@@ -891,6 +995,21 @@ class MainWindow(QMainWindow):
         self.log(f"estimated scale for {sp.name}: {s:.3f} A per DPD length unit "
                  f"(template bead distances / CG bond lengths)")
 
+    def output_settings(self) -> OutputSettings:
+        for txt, what in ((self.ed_k.text(), "restraint constants"), (self.ed_dt.text(), "time steps")):
+            try:
+                [float(v) for v in txt.split()]
+            except ValueError:
+                raise ValueError(f"{what} must be numbers separated by spaces: {txt!r}") from None
+        return OutputSettings(
+            basename=self.ed_base.text().strip() or "system", cutoff=self.spn_cut.value(),
+            long_range=self.chk_long.isChecked(), soft_stage=self.chk_soft.isChecked(),
+            min_steps=self.spn_steps.value(), bonded_stage=self.chk_bonded.isChecked(),
+            restrained=self.chk_restr.isChecked() and bool(self.ed_k.text().split()),
+            restraint_k=self.ed_k.text().strip() or "0", md_steps=self.spn_md.value(),
+            md_timesteps=self.ed_dt.text().strip() or "1.0", temperature=self.spn_temp.value(),
+            release=self.chk_release.isChecked())
+
     def _jobs(self):
         jobs, skipped = [], []
         for i, sp in enumerate(self.cg.species):
@@ -900,7 +1019,7 @@ class MainWindow(QMainWindow):
             if st is None or st.aa is None or st.mapping is None or not st.mapping.mapped_beads():
                 skipped.append(sp.name)
                 continue
-            jobs.append((sp, st.aa, st.mapping))
+            jobs.append(Job(sp, st.aa, st.mapping, st.copies if sp.n_beads == 1 else 1))
         return jobs, skipped
 
     def run(self):
@@ -911,18 +1030,20 @@ class MainWindow(QMainWindow):
         if not jobs:
             self.error("Nothing to do", "No species has an all-atom template with a mapping yet.")
             return
-        for sp, mol, mp in jobs:
-            if mol.ff is None:
-                self.error("Missing force field", f"{mol.name} has no force field; select it in step 2.")
+        for j in jobs:
+            if j.mol.ff is None:
+                self.error("Missing force field", f"{j.mol.name} has no force field; select it in step 2.")
                 return
         if skipped:
             self.log("species without template/mapping are left out: " + ", ".join(skipped))
         bm = self.backmap_settings()
         ov = OverlapSettings(enabled=self.g_ov.isChecked(), d_min=self.spn_dmin.value(),
                              max_iter=self.spn_oviter.value(), heavy_only=self.chk_heavy.isChecked())
-        outs = OutputSettings(basename=self.ed_base.text().strip() or "system", cutoff=self.spn_cut.value(),
-                              long_range=self.chk_long.isChecked(), soft_stage=self.chk_soft.isChecked(),
-                              min_steps=self.spn_steps.value())
+        try:
+            outs = self.output_settings()
+        except ValueError as exc:
+            self.error("Invalid relaxation settings", str(exc))
+            return
         mini = MinimizeSettings(enabled=self.g_min.isChecked(), lammps_exe=self.ed_lmp.text().strip(),
                                 mpi=self.spn_mpi.value())
         if mini.enabled:
@@ -1003,13 +1124,12 @@ class MainWindow(QMainWindow):
                 sp = self.cg.species[i]
                 p.assignments.append(SpeciesAssignment(
                     species_bead_names=sp.bead_names, species_index=i, aa_path=st.aa_path,
-                    ff_path=st.ff_path or None, mapping=st.mapping.to_dict(st.aa), enabled=st.enabled))
+                    ff_path=st.ff_path or None, mapping=st.mapping.to_dict(st.aa), enabled=st.enabled,
+                    copies_per_bead=st.copies))
         p.backmap = self.backmap_settings()
         p.overlap = OverlapSettings(enabled=self.g_ov.isChecked(), d_min=self.spn_dmin.value(),
                                     max_iter=self.spn_oviter.value(), heavy_only=self.chk_heavy.isChecked())
-        p.output = OutputSettings(basename=self.ed_base.text().strip() or "system", cutoff=self.spn_cut.value(),
-                                  long_range=self.chk_long.isChecked(), soft_stage=self.chk_soft.isChecked(),
-                                  min_steps=self.spn_steps.value())
+        p.output = self.output_settings()
         p.minimize = MinimizeSettings(enabled=self.g_min.isChecked(), lammps_exe=self.ed_lmp.text().strip(),
                                       mpi=self.spn_mpi.value())
         return p
@@ -1046,7 +1166,7 @@ class MainWindow(QMainWindow):
         self.cmb_split.setCurrentText({"auto": "auto", "molid": "molecule ID", "bonds": "bonds"}[p.split])
         b = p.backmap
         self.spn_scale.setValue(b.scale)
-        self.cmb_mode.setCurrentIndex(1 if b.mode == "flex" else 0)
+        self.cmb_mode.setCurrentIndex({"rigid": 0, "flex": 1, "fragment": 2}.get(b.mode, 0))
         self.spn_flex.setValue(b.flex_weight)
         self.chk_spin.setChecked(b.random_spin)
         self.spn_seed.setValue(b.seed)
@@ -1058,8 +1178,16 @@ class MainWindow(QMainWindow):
         self.ed_base.setText(p.output.basename)
         self.spn_cut.setValue(p.output.cutoff)
         self.chk_long.setChecked(p.output.long_range)
-        self.chk_soft.setChecked(p.output.soft_stage)
-        self.spn_steps.setValue(p.output.min_steps)
+        o = p.output
+        self.chk_soft.setChecked(o.soft_stage)
+        self.spn_steps.setValue(o.min_steps)
+        self.chk_bonded.setChecked(o.bonded_stage)
+        self.chk_restr.setChecked(o.restrained)
+        self.ed_k.setText(o.restraint_k)
+        self.spn_md.setValue(o.md_steps)
+        self.ed_dt.setText(o.md_timesteps)
+        self.spn_temp.setValue(o.temperature)
+        self.chk_release.setChecked(o.release)
         self.g_min.setChecked(p.minimize.enabled)
         if p.minimize.lammps_exe:
             self.ed_lmp.setText(p.minimize.lammps_exe)
@@ -1071,14 +1199,14 @@ class MainWindow(QMainWindow):
             try:
                 sp = resolve_species(self.cg, a)
                 i = self.cg.species.index(sp)
-                mol = parse_molecule(a.aa_path, a.ff_path)
+                mol = load_template(a.aa_path, a.ff_path)
                 mp = BeadMapping.from_dict(a.mapping, mol)
             except Exception as exc:  # noqa: BLE001
                 self.error("Cannot restore species", str(exc))
                 continue
             self.states[i] = SpeciesState(aa=mol, mapping=mp, aa_path=a.aa_path,
                                           ff_path=a.ff_path or (mol.ff.path if mol.ff else ""),
-                                          enabled=a.enabled)
+                                          enabled=a.enabled, copies=a.copies_per_bead)
         self._fill_species_table()
         if self.cg.species:
             first = min((self.cg.species.index(resolve_species(self.cg, a)) for a in p.assignments), default=0)

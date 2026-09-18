@@ -25,13 +25,16 @@ Optionally it removes overlaps and minimises the result with LAMMPS.
   proposal is available for chain-like molecules.
 - Live preview of the fitted molecule on top of any CG molecule of the species.
 - Scale (Å per DPD length unit) can be estimated from the template and CG bond lengths.
-- Placement by weighted **Kabsch** fit of bead centres (rigid; optionally with a
-  per-bead shift). For (near-)linear molecules the undetermined spin about the long axis
-  is randomised.
+- Placement by **Kabsch** fit of bead centres, in three modes: *rigid* template,
+  *rigid + per-bead shift*, and **per-bead fragments** (every bead's atom group is aligned
+  to its neighbour beads, in the spirit of CG2AT) for flexible molecules. For
+  (near-)linear molecules the undetermined spin about the long axis is randomised.
+- **Solvent**: single-bead species (e.g. DPD water) can be replaced by *N_m* molecules
+  per bead; a built-in SPC water template uses the force field's `OW`/`H` types.
 - Simple **overlap removal**: spin search about the long axis, then rigid-body pushes.
 - Writes a LAMMPS `full` data file, `*.in.init`, `*.in.settings` (pair and bonded
-  coefficients from the force field) and a minimisation script (soft push-off + full
-  force field), and can run LAMMPS directly.
+  coefficients from the force field) and a **restrained, gradual relaxation** script
+  (see below), and can run LAMMPS directly.
 - Projects (CG file, templates, mappings, settings) are saved as JSON and can be re-run
   headless from the command line.
 
@@ -84,25 +87,63 @@ double-click on empty space resets the view.
 | `system.data` | all-atom LAMMPS data file (`atom_style full`, image flags) |
 | `system.in.init` | units and styles taken from the force field |
 | `system.in.settings` | includes `system.in.bonded` and `system.in.pair` |
-| `system.min.in` | minimisation: soft push-off, then full force field → `system_min.data` |
+| `system.min.in` | restrained, gradual relaxation → `system_min.data` |
 
 Run it yourself with `lmp -in system.min.in` inside the output folder.
 
 ## Method
 
-For every CG molecule *i* with bead positions **X**ᵢ (DPD units, made whole) the target
-bead positions are **T**ᵢ = *s* **X**ᵢ, with *s* the scale in Å per DPD length unit. The
-template bead centres **B** are computed from the mapped atoms. The rotation **R** and
-translation **t** minimising Σₖ |**R** **B**ₖ + **t** − **T**ₖ|² (Kabsch) are applied to
-all template atoms, so the head/tail direction and orientation of every CG molecule are
-kept. When the beads are (nearly) collinear the rotation about the long axis is not
-defined and is drawn at random (optional). In *rigid + per-bead shift* mode each atom is
-additionally moved by the residual of its bead, which follows bent CG conformations at the
-cost of distorted inter-bead bonds (fixed by the minimisation). The box is scaled by *s*.
+**Scale.** CG coordinates are multiplied by *s*, the length of one DPD unit *r*ᶜ in Å,
+entered by the user from the definition of the DPD model (for Groot–Rabone water
+*r*ᶜ = 3.107 *N*ₘ^1/3 Å at ρ = 3). The *Estimate* button only cross-checks *s* from
+template bead distances and CG bond lengths.
 
-Overlap removal looks for heavy atoms of different molecules closer than *d*ₘᵢₙ,
-rotates linear molecules about their axis to the angle with the fewest contacts, and then
-pushes the remaining pairs apart with rigid-body translations.
+**Placement.** For every CG molecule with bead positions **T** = *s* **X** (made whole)
+the template bead centres **B** (centre of mass of the mapped atoms and their hydrogens)
+are fitted with the Kabsch algorithm, min Σₖ |**R** **B**ₖ + **t** − **T**ₖ|². This keeps the
+orientation of every molecule. When the beads are (nearly) collinear the rotation about
+the long axis is undefined and is drawn at random.
+
+- *rigid*: the whole template is placed with (**R**, **t**); internal geometry, chirality
+  and cis/trans isomerism come unchanged from the template.
+- *rigid + per-bead shift*: every atom is additionally translated by the residual of its bead.
+- *per-bead fragments*: after the global fit, the atom group of each bead is rotated by
+  the smallest rotation that maps the template directions to its bonded neighbour beads
+  onto the CG directions (Kabsch on the direction vectors; second neighbours are used for
+  terminal beads) and centred exactly on its bead. Fragments stay internally intact and
+  follow bent CG conformations; stretched bonds between fragments are repaired by the
+  relaxation. This is the recommended mode for flexible molecules.
+
+**Solvent.** A single-bead species can stand for *N*ₘ molecules per bead. *N*ₘ randomly
+oriented copies are placed with their centres drawn in a sphere of *N*ₘ molecular volumes
+around the bead (minimum centre distance 2.6 Å), with the cluster centred on the bead.
+Solvent molecules are written after the solutes and are not restrained. The alternative,
+equally valid for DPD, is to leave the solvent species out and solvate the all-atom
+system afterwards; back-mapping the solvent keeps the hydration of the interface and the
+total volume consistent with the CG model.
+
+**Overlap removal.** Heavy atoms of different molecules closer than *d*ₘᵢₙ are
+detected; linear molecules are first rotated about their axis to the angle with the fewest
+contacts, then remaining pairs are pushed apart by rigid-body translations.
+
+**Relaxation** (`system.min.in`, similar to the *initram* protocol of Backward):
+
+1. minimisation with bonded terms only (`pair_style zero`);
+2. soft-core push-off (`pair_style soft`);
+3. full force field, one minimisation per restraint constant (default 1000, 100,
+   10 kcal mol⁻¹ Å⁻²);
+4. restrained Langevin MD with increasing time step (default 0.2, 0.5, 1 fs;
+   `fix nve/limit`);
+5. final minimisation without restraints.
+
+During stages 1–4 the heavy atoms of the back-mapped solutes are tied to their
+back-mapped positions with `fix spring/self` (the reference stays fixed while the
+constant is lowered), so the structure relaxes locally without drifting away from the
+CG configuration. Each stage can be switched off in the GUI.
+
+Related methods: T. A. Wassenaar et al., *J. Chem. Theory Comput.* 10, 676 (2014)
+(Backward); O. N. Vickery and P. J. Stansfeld, *J. Chem. Theory Comput.* 17, 6472 (2021)
+(CG2AT2).
 
 ## Example: stearylamine
 
@@ -114,8 +155,9 @@ file are relative to the project file; adjust `cg_path` and `aa_path` to your fi
 ## Roadmap
 
 - more atom styles and all-atom input formats (PDB/GRO + ITP, LAMMPS data)
-- fractional/shared atom mappings, per-bead rotations for flexible molecules
-- solvent/ion insertion
+- fractional/shared atom mappings
+- validation report (bead-centre RMSD after relaxation, chirality and ring-piercing checks)
+- ion insertion
 
 ## Tests
 

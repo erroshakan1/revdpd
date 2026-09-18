@@ -304,3 +304,37 @@ def parse_molecule(path: str | Path, ff_path: str | Path | None = None,
         charges=np.array(q), pos=np.array(xyz), topology=topo, ff=ff,
         masses=masses, elements=elements,
     )
+
+
+# ------------------------------------------------------------ built-in water
+SPC_WATER = {
+    # flexible SPC geometry/charges; bonded constants for relaxation only
+    "r_oh": 1.0, "theta": 109.47, "q_o": -0.82, "q_h": 0.41,
+    "k_bond": 450.0, "k_angle": 55.0,
+}
+
+
+def spc_water(ff: ForceField, o_type: str = "OW", h_type: str = "H") -> AAMolecule:
+    """An SPC water molecule using the atom types ``o_type``/``h_type`` of ``ff``.
+
+    Bond and angle types ``SPC_OH``/``SPC_HOH`` (harmonic, flexible) are added to the
+    force field. For production runs constrain water with SHAKE/RATTLE.
+    """
+    for t in (o_type, h_type):
+        if t not in ff.masses:
+            raise LtError(f"force field {ff.name} has no atom type {t!r} for water")
+    w = SPC_WATER
+    half = np.radians(w["theta"]) / 2
+    pos = np.array([[0.0, 0.0, 0.0],
+                    [w["r_oh"] * np.sin(half), w["r_oh"] * np.cos(half), 0.0],
+                    [-w["r_oh"] * np.sin(half), w["r_oh"] * np.cos(half), 0.0]])
+    ff.coeffs["bond"].setdefault("SPC_OH", [f"{w['k_bond']}", f"{w['r_oh']}"])
+    ff.coeffs["angle"].setdefault("SPC_HOH", [f"{w['k_angle']}", f"{w['theta']}"])
+    return AAMolecule(
+        name="SPC", path="<built-in SPC water>", atom_names=["OW", "HW1", "HW2"],
+        atom_types=[o_type, h_type, h_type], charges=np.array([w["q_o"], w["q_h"], w["q_h"]]),
+        pos=pos, topology={"bond": [("SPC_OH", (0, 1)), ("SPC_OH", (0, 2))],
+                           "angle": [("SPC_HOH", (1, 0, 2))]},
+        ff=ff, masses=np.array([ff.masses[o_type], ff.masses[h_type], ff.masses[h_type]]),
+        elements=["O", "H", "H"],
+    )

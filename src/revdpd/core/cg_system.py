@@ -64,10 +64,16 @@ class CGSystem:
 
     # ------------------------------------------------------------------ split
     def _groups_by_molid(self) -> list[np.ndarray]:
+        """Group by molecule ID; beads with ID 0 (often solvent) are split by bonds instead."""
+        zero = self.data.mol == 0
         order = np.lexsort((self.data.ids, self.data.mol))
+        order = order[~zero[order]]
         mols = self.data.mol[order]
         cut = np.flatnonzero(np.diff(mols)) + 1
-        return [g for g in np.split(order, cut) if len(g)]
+        groups = [g for g in np.split(order, cut) if len(g)]
+        if zero.any():
+            groups += [g for g in self._groups_by_bonds() if zero[g[0]]]
+        return groups
 
     def _groups_by_bonds(self) -> list[np.ndarray]:
         n = self.data.n_atoms

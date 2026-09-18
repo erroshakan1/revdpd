@@ -20,6 +20,7 @@ class MoleculeSet:
 
     template: AAMolecule
     coords: list[np.ndarray]
+    restrain: bool = True          # position-restrain heavy atoms during relaxation
 
 
 @dataclass
@@ -33,6 +34,15 @@ class OutputSettings:
     min_steps: int = 5000
     etol: float = 1.0e-4
     ftol: float = 1.0e-6
+    # restrained, gradual relaxation (Backward/initram-like)
+    bonded_stage: bool = True     # bonded-only minimisation first (no non-bonded terms)
+    restrained: bool = True       # restrain heavy atoms to their back-mapped positions
+    restraint_k: str = "1000 100 10"   # kcal/mol/A^2, one full-force-field minimisation per value
+    md_steps: int = 1000          # steps per MD stage (0 = no MD)
+    md_timesteps: str = "0.2 0.5 1.0"  # fs, one restrained MD stage per value
+    temperature: float = 300.0
+    release: bool = True          # final minimisation without restraints
+    seed: int = 4928459
 
 
 @dataclass
@@ -62,7 +72,14 @@ def _merge_ff(sets: list[MoleculeSet]) -> ForceField:
         if f.path != base.path or f.name != base.name:
             raise ValueError("all templates must use the same force field file "
                              f"({base.path} vs {f.path})")
-    return base
+    # templates may add their own bonded types (e.g. built-in water): merge them
+    merged = ForceField(name=base.name, path=base.path, init_lines=base.init_lines,
+                        masses=base.masses, pair=base.pair, extra_settings=base.extra_settings)
+    for f in ffs:
+        for k, d in f.coeffs.items():
+            for t, v in d.items():
+                merged.coeffs[k].setdefault(t, v)
+    return merged
 
 
 def write_lammps(out_dir: str | Path, sets: list[MoleculeSet], box: Box,
@@ -178,28 +195,81 @@ def write_lammps(out_dir: str | Path, sets: list[MoleculeSet], box: Box,
     res.files.update(settings=out / f"{b}.in.settings", init=out / f"{b}.in.init")
 
     # ---- run script
-    R = [f"# minimisation of back-mapped structure (revdpd {__version__})", ""]
-    R += init
-    R += ["", f"read_data {b}.data", ""]
-    R += [f"include {b}.in.bonded", ""]
-    R += ["thermo 100", "thermo_style custom step pe ebond eangle edihed evdwl ecoul elong press", ""]
-    if st.soft_stage:
-        R += ["# --- stage 1: soft push-off (removes overlaps without infinite forces)",
-              f"pair_style soft {st.soft_rc}",
-              f"pair_coeff * * {st.soft_a}",
-              "comm_modify cutoff 8.0",
-              f"minimize {st.etol} {st.ftol} {st.min_steps // 2} {st.min_steps * 5}",
-              "reset_timestep 0", ""]
-    R += ["# --- stage 2: full force field", pair_style]
-    if kspace:
-        R.append(kspace)
-    R += [f"include {b}.in.pair", "neigh_modify delay 0 every 1 check yes one 5000",
-          f"minimize {st.etol} {st.ftol} {st.min_steps} {st.min_steps * 10}",
-          "", f"write_data {b}_min.data pair ij", ""]
+    heavy_types = [str(i) for t, i in atypes.items() if ff.masses[t] > 1.5]
+    n_restr = 0
+    for srt in sets:
+        if not srt.restrain:
+            break
+        n_restr += len(srt.coords)
+    restrain = st.restrained and n_restr > 0
+    ks = [float(x) for x in st.restraint_k.split()] if restrain else []
+    dts = [float(x) for x in st.md_timesteps.split()] if st.md_steps > 0 else []
     run = out / f"{b}.min.in"
-    run.write_text("\n".join(R))
+    run.write_text("\n".join(relaxation_script(b, init, pair_style, kspace, st, heavy_types,
+                                                 n_restr if restrain else 0, ks, dts)))
     res.files["run"] = run
     return res
+
+
+def relaxation_script(b: str, init: list[str], pair_style: str, kspace: str | None,
+                      st: OutputSettings, heavy_types: list[str], n_restr: int,
+                      ks: list[float], dts: list[float]) -> list[str]:
+    """LAMMPS input for a restrained, gradual relaxation of the back-mapped structure.
+
+    1. bonded-only minimisation (no non-bonded terms)   - repairs stretched bonds/angles
+    2. soft-core push-off                               - removes overlaps
+    3. full force field, restraints k1 > k2 > ...        - one minimisation per value
+    4. restrained MD with increasing time step           - relaxes locally at T
+    5. minimisation without restraints                   - final structure
+    Heavy atoms of the restrained molecules (molecule IDs 1..n_restr) are tied to their
+    back-mapped positions with ``fix spring/self`` (reference fixed at step 0).
+    """
+    mn = f"minimize {st.etol} {st.ftol} {st.min_steps} {st.min_steps * 10}"
+    R = [f"# restrained relaxation of the back-mapped structure (revdpd {__version__})", ""]
+    R += init
+    R += ["", f"read_data {b}.data", f"include {b}.in.bonded",
+          "neigh_modify delay 0 every 1 check yes one 5000", "thermo 100", ""]
+    if n_restr:
+        R += ["# position restraints on heavy atoms of the back-mapped molecules",
+              f"group solute molecule 1:{n_restr}",
+              f"group heavy type {' '.join(heavy_types)}",
+              "group posres intersect solute heavy",
+              f"variable kres equal {ks[0] if ks else 1000.0:g}",
+              "fix posres posres spring/self v_kres",
+              "fix_modify posres energy yes"]
+    R += ["thermo_style custom step temp pe ebond eangle edihed evdwl ecoul elong "
+          + ("f_posres " if n_restr else "") + "press", ""]
+    if st.bonded_stage:
+        R += ["# --- stage 1: bonded terms only",
+              f"pair_style zero {st.cutoff:g}", "pair_coeff * *",
+              mn, "reset_timestep 0", ""]
+    if st.soft_stage:
+        R += ["# --- stage 2: soft push-off (removes overlaps without infinite forces)",
+              f"pair_style soft {st.soft_rc}", f"pair_coeff * * {st.soft_a}",
+              "comm_modify cutoff 8.0", mn, "reset_timestep 0", ""]
+    R += ["# --- stage 3: full force field", pair_style]
+    if kspace:
+        R.append(kspace)
+    R.append(f"include {b}.in.pair")
+    if ks:
+        for k in ks:
+            R += [f"variable kres equal {k:g}", mn]
+    else:
+        R.append(mn)
+    R.append("")
+    if dts:
+        R += ["# --- stage 4: restrained MD with increasing time step",
+              f"velocity all create {st.temperature:g} {st.seed} dist gaussian",
+              "fix mdint all nve/limit 0.1",
+              f"fix mdtemp all langevin {st.temperature:g} {st.temperature:g} 100.0 {st.seed + 1}"]
+        for dt in dts:
+            R += [f"timestep {dt:g}", f"run {st.md_steps}"]
+        R += ["unfix mdint", "unfix mdtemp", ""]
+    if n_restr and st.release:
+        R += ["# --- stage 5: release restraints", "unfix posres",
+              "thermo_style custom step pe ebond eangle edihed evdwl ecoul elong press", mn, ""]
+    R += [f"write_data {b}_min.data pair ij", ""]
+    return R
 
 
 def _init_block(ff: ForceField, st: OutputSettings) -> tuple[list[str], str, str | None]:
