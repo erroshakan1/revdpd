@@ -345,7 +345,7 @@ class MainWindow(QMainWindow):
         f6.addRow("Base name", self.ed_base)
         self.spn_cut = QDoubleSpinBox()
         self.spn_cut.setRange(4, 30)
-        self.spn_cut.setValue(12.0)
+        self.spn_cut.setValue(14.0)
         self.spn_cut.setSuffix(" A")
         f6.addRow("Pair cutoff", self.spn_cut)
         self.chk_long = QCheckBox("Long-range electrostatics (kspace)")

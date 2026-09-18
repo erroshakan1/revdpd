@@ -26,7 +26,7 @@ class MoleculeSet:
 @dataclass
 class OutputSettings:
     basename: str = "system"
-    cutoff: float = 12.0
+    cutoff: float = 14.0           # Angstrom (GROMOS was parametrised with 1.4 nm)
     long_range: bool = True       # keep coul/long + kspace from the force field
     soft_stage: bool = True       # soft-potential push-off before the real minimisation
     soft_a: float = 30.0          # kcal/mol, pair_style soft prefactor
@@ -273,7 +273,13 @@ def relaxation_script(b: str, init: list[str], pair_style: str, kspace: str | No
 
 
 def _init_block(ff: ForceField, st: OutputSettings) -> tuple[list[str], str, str | None]:
-    init, pair_style, kspace = [], None, None
+    """Split the force field's init commands into (general, pair block, kspace).
+
+    The pair block is ``pair_style`` followed by any ``pair_modify`` lines (e.g.
+    ``pair_modify mix geometric`` for OPLS-AA), which LAMMPS only accepts after the
+    pair style has been defined and which must be repeated whenever it is redefined.
+    """
+    init, pair_style, kspace, modify = [], None, None, []
     for ln in ff.init_lines:
         tok = ln.split()
         if not tok:
@@ -282,6 +288,8 @@ def _init_block(ff: ForceField, st: OutputSettings) -> tuple[list[str], str, str
             pair_style = " ".join(tok).replace("${cutoff}", f"{st.cutoff:g}")
         elif tok[0] == "kspace_style":
             kspace = " ".join(tok)
+        elif tok[0] == "pair_modify":
+            modify.append(" ".join(tok))
         else:
             init.append(" ".join(tok))
     if pair_style is None:
@@ -289,4 +297,4 @@ def _init_block(ff: ForceField, st: OutputSettings) -> tuple[list[str], str, str
     if not st.long_range:
         pair_style = pair_style.replace("coul/long", "coul/cut")
         kspace = None
-    return init, pair_style, kspace
+    return init, "\n".join([pair_style] + modify), kspace

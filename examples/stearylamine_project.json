@@ -25,7 +25,7 @@
   "backmap": {"scale": 8.566, "mode": "rigid", "flex_weight": 1.0, "random_spin": true,
               "linear_threshold": 0.15, "seed": 2024},
   "overlap": {"enabled": true, "d_min": 2.5, "max_iter": 60, "heavy_only": true},
-  "output": {"basename": "system", "cutoff": 12.0, "long_range": true, "soft_stage": true,
+  "output": {"basename": "system", "cutoff": 14.0, "long_range": true, "soft_stage": true,
              "soft_a": 30.0, "soft_rc": 2.5, "min_steps": 5000, "etol": 0.0001, "ftol": 1e-06},
   "minimize": {"enabled": false, "lammps_exe": "", "mpi": 1},
   "out_dir": "backmapped"

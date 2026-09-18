@@ -6,6 +6,8 @@ CG bead** by clicking in two side-by-side 3D views, and then places an all-atom 
 every molecule into the system **keeping the orientation of each CG molecule**.
 Optionally it removes overlaps and minimises the result with LAMMPS.
 
+[![tests](https://github.com/erroshakan1/revdpd/actions/workflows/tests.yml/badge.svg)](https://github.com/erroshakan1/revdpd/actions/workflows/tests.yml)
+
 ![revdpd screenshot](docs/screenshot.png)
 
 ## Features
@@ -40,16 +42,33 @@ Optionally it removes overlaps and minimises the result with LAMMPS.
 
 ## Installation
 
+The easiest way is [pipx](https://pipx.pypa.io) (or [uv](https://docs.astral.sh/uv/)),
+which installs revdpd in its own isolated environment and puts the `revdpd` command on
+your `PATH`:
+
 ```bash
-git clone <this repository> revdpd && cd revdpd
-python -m venv .venv && source .venv/bin/activate      # fish: source .venv/bin/activate.fish
-pip install -e .            # or: pip install -e ".[dev]" to also get pytest
+pipx install git+https://github.com/erroshakan1/revdpd
+# or
+uv tool install git+https://github.com/erroshakan1/revdpd
 ```
 
-Requirements: Python ≥ 3.10, NumPy, SciPy, PySide6. LAMMPS is only needed for the
-optional minimisation (with the `MOLECULE`, `KSPACE` and `EXTRA-MOLECULE` packages for
-GROMOS/ATB force fields). The executable is searched as `lmp`, `lmp_serial`, `lmp_mpi` …
-in `PATH` or taken from `$LAMMPS_EXE`, and can be chosen in the GUI.
+Update later with `pipx upgrade revdpd` (or `uv tool upgrade revdpd`).
+Plain pip works as well: `pip install git+https://github.com/erroshakan1/revdpd`.
+
+For development:
+
+```bash
+git clone https://github.com/erroshakan1/revdpd && cd revdpd
+python -m venv .venv && source .venv/bin/activate      # fish: source .venv/bin/activate.fish
+pip install -e ".[dev]"
+pytest
+```
+
+Requirements: Python ≥ 3.10, NumPy, SciPy, PySide6 (installed automatically). LAMMPS is
+only needed for the optional relaxation (with the `MOLECULE`, `KSPACE` and
+`EXTRA-MOLECULE` packages for GROMOS/ATB force fields). The executable is searched as
+`lmp`, `lmp_serial`, `lmp_mpi` … in `PATH` or taken from `$LAMMPS_EXE`, and can be chosen
+in the GUI.
 
 ## Usage
 
@@ -166,8 +185,13 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The LAMMPS test is skipped when no LAMMPS executable is found.
+The LAMMPS tests are skipped when no LAMMPS executable is found.
+
+## Contributing
+
+Bug reports and feature requests are welcome in the
+[issue tracker](https://github.com/erroshakan1/revdpd/issues).
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).

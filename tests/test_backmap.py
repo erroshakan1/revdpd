@@ -165,3 +165,14 @@ def test_molid_zero_is_split_by_bonds(tmp_path):
     (tmp_path / "z.data").write_text("\n".join(lines) + "\n")
     cg = CGSystem(read_lammps_data(tmp_path / "z.data", "angle"), "molid")
     assert cg.species[0].count == 5
+
+
+def test_pair_modify_follows_pair_style(tmp_path):
+    from revdpd.io.lammps_writer import MoleculeSet, write_lammps
+    m = parse_molecule(write_aa(tmp_path))
+    m.ff.init_lines.insert(1, "pair_modify mix geometric")       # e.g. OPLS-AA
+    box = Box(np.zeros(3), np.full(3, 40.0))
+    res = write_lammps(tmp_path / "o", [MoleculeSet(m, [m.pos + 20.0])], box, OutputSettings(cutoff=10.0))
+    for f in (res.files["init"], res.files["run"]):
+        lines = [ln for ln in f.read_text().splitlines() if ln.startswith(("pair_style lj", "pair_modify"))]
+        assert lines == ["pair_style lj/cut/coul/long 10", "pair_modify mix geometric"], lines
