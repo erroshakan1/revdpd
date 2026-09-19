@@ -34,6 +34,9 @@ Optionally it removes overlaps and minimises the result with LAMMPS.
   (near-)linear molecules the undetermined spin about the long axis is randomised.
 - **Solvent**: single-bead species (e.g. DPD water) can be replaced by *N_m* molecules
   per bead; a built-in SPC water template uses the force field's `OW`/`H` types.
+- **Ions**: optional neutralisation with counter-ions and/or salt at a chosen
+  concentration (e.g. 0.15 M), placed by replacing water molecules (`NA+`/`CL-` of GROMOS
+  54A7 by default).
 - Simple **overlap removal**: spin search about the long axis, then rigid-body pushes.
 - Writes a LAMMPS `full` data file, `*.in.init`, `*.in.settings` (pair and bonded
   coefficients from the force field) and a **restrained, gradual relaxation** script
@@ -119,7 +122,7 @@ e.g. prefix `mpirun -np 4` and arguments `-sf omp -pk omp 8`; *Stop* terminates 
 
 **Scale.** CG coordinates are multiplied by *s*, the length of one DPD unit *r*ᶜ in Å,
 entered by the user from the definition of the DPD model (for Groot–Rabone water
-*r*ᶜ = 3.107 *N*ₘ^1/3 Å at ρ = 3). The *Estimate* button only cross-checks *s* from
+*r*ᶜ = 3.107 (ρ *N*ₘ)^1/3 Å, e.g. 6.46 Å for ρ = 3 and *N*ₘ = 3). The *Estimate* button only cross-checks *s* from
 template bead distances and CG bond lengths.
 
 **Placement.** For every CG molecule with bead positions **T** = *s* **X** (made whole)
@@ -145,6 +148,13 @@ Solvent molecules are written after the solutes and are not restrained. The alte
 equally valid for DPD, is to leave the solvent species out and solvate the all-atom
 system afterwards; back-mapping the solvent keeps the hydration of the interface and the
 total volume consistent with the CG model.
+
+**Ions.** With *Neutralise*, round(|Q|) counter-ions are added for a net charge Q; with
+*Add salt*, round(c · N_water / 55.5) cation/anion pairs are added for a concentration c
+(mol/L). Each ion replaces a randomly chosen water molecule whose oxygen is at least
+*d*ₘᵢₙ (default 5 Å) from any solute heavy atom and from the other ions, so the density is
+unchanged; the distances are relaxed automatically if not enough sites exist. Ions are
+written last and are not restrained.
 
 **Overlap removal.** Heavy atoms of different molecules closer than *d*ₘᵢₙ are
 detected; linear molecules are first rotated about their axis to the angle with the fewest
@@ -186,7 +196,7 @@ file are relative to the project file; adjust `cg_path` and `aa_path` to your fi
 - more atom styles and all-atom input formats (PDB/GRO + ITP, LAMMPS data)
 - fractional/shared atom mappings
 - validation report (bead-centre RMSD after relaxation, chirality and ring-piercing checks)
-- ion insertion
+- back-mapping of explicit CG ion beads
 
 ## Tests
 

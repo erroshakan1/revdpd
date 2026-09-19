@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core.backmap import BackmapSettings, Fitter, estimate_scale, place_cluster
 from ..core.cg_system import CGSystem
+from ..core.ions import IonSettings, is_water
 from ..core.lammps_runner import Cancelled, find_lammps, kill_process_tree
 from ..core.mapping import BeadMapping, atom_owners, auto_linear_mapping, reverse_mapping
 from ..core.pipeline import (
@@ -57,6 +58,9 @@ directly.</li>
 <li><b>Solvent</b>: a single-bead species (e.g. DPD water) can be replaced by N_m molecules per
 bead (<i>Molecules per bead</i>); <i>Built-in SPC water</i> provides a water template.
 Alternatively untick the solvent species and solvate the all-atom system afterwards.</li>
+<li><b>Ions</b>: <i>Neutralise</i> replaces water molecules by counter-ions until the total charge is
+zero; <i>Add salt</i> additionally adds cation/anion pairs at the given concentration
+(0.15 M ~ physiological NaCl). Ions keep a minimum distance from solutes and from each other.</li>
 </ol>
 <h3>Mouse</h3>
 Left drag: rotate &nbsp; Ctrl+left drag: roll &nbsp; Right/middle drag: pan &nbsp;
@@ -352,6 +356,36 @@ class MainWindow(QMainWindow):
         self.chk_heavy.setChecked(True)
         f5.addRow(self.chk_heavy)
         R.addWidget(self.g_ov)
+
+        g_ion = QGroupBox("Ions (replace water molecules)")
+        fi = QFormLayout(g_ion)
+        self.chk_neutral = QCheckBox("Neutralise the system (counter-ions)")
+        self.chk_neutral.setToolTip("Adds as many cations/anions as needed to make the total charge zero")
+        fi.addRow(self.chk_neutral)
+        self.chk_salt = QCheckBox("Add salt")
+        self.spn_conc = QDoubleSpinBox()
+        self.spn_conc.setRange(0.0, 5.0)
+        self.spn_conc.setDecimals(3)
+        self.spn_conc.setSingleStep(0.05)
+        self.spn_conc.setValue(0.150)
+        self.spn_conc.setSuffix(" M")
+        self.spn_conc.setToolTip("Salt concentration in mol/L relative to the water (0.15 M ~ physiological)")
+        self.spn_conc.setEnabled(False)
+        self.chk_salt.toggled.connect(self.spn_conc.setEnabled)
+        fi.addRow(self.chk_salt, self.spn_conc)
+        self.ed_cation = QLineEdit("NA+")
+        self.ed_anion = QLineEdit("CL-")
+        for e in (self.ed_cation, self.ed_anion):
+            e.setMaximumWidth(70)
+            e.setToolTip("Atom type in the force field (GROMOS: NA+, CL-, K+ ...)")
+        fi.addRow("Cation / anion", _hline(self.ed_cation, QLabel("/"), self.ed_anion, 1))
+        self.spn_dsol = QDoubleSpinBox()
+        self.spn_dsol.setRange(0.0, 20.0)
+        self.spn_dsol.setValue(5.0)
+        self.spn_dsol.setSuffix(" A")
+        self.spn_dsol.setToolTip("Minimum distance of an ion from solute heavy atoms and from other ions")
+        fi.addRow("Min. distance", self.spn_dsol)
+        R.addWidget(g_ion)
 
         g6 = QGroupBox("Output")
         f6 = QFormLayout(g6)
@@ -1095,6 +1129,13 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self.error("Invalid relaxation settings", str(exc))
             return
+        ions = self.ion_settings()
+        if (ions.neutralize or ions.add_salt) and not any(
+                is_water(j.mol) and j.copies >= 1 for j in jobs):
+            self.error("No water for the ions",
+                       "Ions replace water molecules, but no water species is back-mapped.\n"
+                       "Assign water (e.g. 'Built-in SPC water') to the solvent species or untick the ion options.")
+            return
         mini = self.minimize_settings()
         if mini.enabled:
             self.settings.setValue("lammps_exe", mini.lammps_exe)
@@ -1110,7 +1151,7 @@ class MainWindow(QMainWindow):
 
         def task(log, progress, stop, on_process):
             return run_backmapping(cg, jobs, bm, ov, outs, out_dir, mini, log=log,
-                                   progress=progress, stop=stop, on_process=on_process)
+                                   progress=progress, stop=stop, on_process=on_process, ions=ions)
 
         self.thread = QThread(self)
         self.worker = Worker(task)
@@ -1138,6 +1179,12 @@ class MainWindow(QMainWindow):
     def on_cancelled(self):
         self.progress.setFormat("stopped")
         self.log("stopped by user" + (" (LAMMPS process terminated)" if self.worker and self.worker.proc else ""))
+
+    def ion_settings(self) -> IonSettings:
+        return IonSettings(neutralize=self.chk_neutral.isChecked(), add_salt=self.chk_salt.isChecked(),
+                           concentration=self.spn_conc.value(), cation=self.ed_cation.text().strip(),
+                           anion=self.ed_anion.text().strip(), min_dist_solute=self.spn_dsol.value(),
+                           min_dist_ion=self.spn_dsol.value())
 
     def minimize_settings(self) -> MinimizeSettings:
         return MinimizeSettings(enabled=self.g_min.isChecked(), lammps_exe=self.ed_lmp.text().strip(),
@@ -1201,6 +1248,7 @@ class MainWindow(QMainWindow):
                                     max_iter=self.spn_oviter.value(), heavy_only=self.chk_heavy.isChecked())
         p.output = self.output_settings()
         p.minimize = self.minimize_settings()
+        p.ions = self.ion_settings()
         return p
 
     def save_project(self):
@@ -1262,6 +1310,12 @@ class MainWindow(QMainWindow):
             self.ed_lmp.setText(p.minimize.lammps_exe)
         self.ed_prefix.setText(p.minimize.prefix or (f"mpirun -np {p.minimize.mpi}" if p.minimize.mpi > 1 else ""))
         self.ed_extra.setText(p.minimize.extra_args)
+        self.chk_neutral.setChecked(p.ions.neutralize)
+        self.chk_salt.setChecked(p.ions.add_salt)
+        self.spn_conc.setValue(p.ions.concentration)
+        self.ed_cation.setText(p.ions.cation)
+        self.ed_anion.setText(p.ions.anion)
+        self.spn_dsol.setValue(p.ions.min_dist_solute)
         self.cmb_minstyle.setCurrentText(o.min_style)
         self.load_cg()
         if self.cg is None:

@@ -27,6 +27,7 @@ from .backmap import BackmapSettings, backmap_species
 from .cg_system import CGSpecies, CGSystem
 from .lammps_runner import Cancelled, build_command, find_lammps, run_lammps
 from .mapping import BeadMapping
+from .ions import IonSettings, add_ions
 from .overlap import remove_overlaps
 
 
@@ -74,6 +75,7 @@ class Project:
     overlap: OverlapSettings = field(default_factory=OverlapSettings)
     output: OutputSettings = field(default_factory=OutputSettings)
     minimize: MinimizeSettings = field(default_factory=MinimizeSettings)
+    ions: IonSettings = field(default_factory=IonSettings)
     out_dir: str = "backmapped"
 
     def save(self, path: str | Path) -> None:
@@ -105,6 +107,7 @@ class Project:
         p.overlap = OverlapSettings(**d.get("overlap", {}))
         p.output = OutputSettings(**d.get("output", {}))
         p.minimize = MinimizeSettings(**d.get("minimize", {}))
+        p.ions = IonSettings(**d.get("ions", {}))
         return p
 
 
@@ -136,7 +139,8 @@ class Job:
 
 def run_backmapping(cg: CGSystem, jobs: list, bm: BackmapSettings, ov: OverlapSettings,
                     outset: OutputSettings, out_dir: str | Path, mini: MinimizeSettings | None = None,
-                    log=print, progress=None, stop=None, on_process=None) -> BackmapResult:
+                    log=print, progress=None, stop=None, on_process=None,
+                    ions: IonSettings | None = None) -> BackmapResult:
     """``jobs``: :class:`Job` objects or (species, molecule, mapping[, copies]) tuples.
 
     ``stop()`` returning True aborts with :class:`Cancelled`; ``on_process(proc)`` receives
@@ -178,6 +182,9 @@ def run_backmapping(cg: CGSystem, jobs: list, bm: BackmapSettings, ov: OverlapSe
             s.coords = fixed[k:k + len(s.coords)]
             k += len(s.coords)
 
+    if ions and (ions.neutralize or ions.add_salt):
+        ff = next(s.template.ff for s in sets if s.template.ff is not None)
+        sets = add_ions(sets, box, ff, ions, log=log)
     if stop and stop():
         raise Cancelled("stopped by user")
     wr = write_lammps(out_dir, sets, box, outset)
@@ -237,4 +244,4 @@ def run_project(project: Project, log=print) -> BackmapResult:
         mol = load_template(a.aa_path, a.ff_path)
         jobs.append(Job(sp, mol, BeadMapping.from_dict(a.mapping, mol), a.copies_per_bead))
     return run_backmapping(cg, jobs, project.backmap, project.overlap, project.output,
-                           project.out_dir, project.minimize, log=log)
+                           project.out_dir, project.minimize, log=log, ions=project.ions)
