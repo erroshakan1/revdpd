@@ -687,6 +687,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             self.error("Cannot read all-atom template", str(exc))
             return
+        missing = mol.missing_coeffs()
+        if missing:
+            txt = "\n".join(f"  {k}: {', '.join(v)}" for k, v in missing.items())
+            self.log(f"WARNING: {mol.name} uses types that are not defined in {mol.ff.path}:\n{txt}")
+            QMessageBox.warning(
+                self, "Force-field parameters missing",
+                f"{mol.name} uses types that are not defined in the force-field file\n{mol.ff.path}:\n\n"
+                f"{txt}\n\nThe molecule can be mapped, but LAMMPS files cannot be written. ATB extends "
+                "GROMOS 54A7 with new types over time: download the force-field file that belongs to "
+                "this topology (same ATB revision) and select it under 'Force field'.")
         if mol.ff is None:
             QMessageBox.warning(self, "Force field not found",
                                 "The force field this molecule inherits from was not found next to it.\n"

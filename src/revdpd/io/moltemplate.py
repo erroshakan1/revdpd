@@ -82,6 +82,20 @@ class AAMolecule:
     def bonds(self) -> list[tuple[int, int]]:
         return [idx for _, idx in self.topology.get("bond", [])]
 
+    def missing_coeffs(self) -> dict[str, list[str]]:
+        """Bonded/atom types used by the molecule but not defined in its force field."""
+        if self.ff is None:
+            return {}
+        out: dict[str, list[str]] = {}
+        for kind, lst in self.topology.items():
+            miss = sorted({t for t, _ in lst if t not in self.ff.coeffs.get(kind, {})})
+            if miss:
+                out[kind] = miss
+        miss = sorted({t for t in self.atom_types if t not in self.ff.masses})
+        if miss:
+            out["mass"] = miss
+        return out
+
     def heavy_mask(self) -> np.ndarray:
         return np.array([e != "H" for e in self.elements])
 
@@ -118,7 +132,7 @@ def _find_block(text: str, start: int) -> tuple[int, int]:
     raise LtError("unbalanced braces")
 
 
-_OBJ_RE = re.compile(r"(?m)^\s*([A-Za-z_][\w.\-]*)\s*(?:inherits\s+([\w.\-/ ,]+?))?\s*\{")
+_OBJ_RE = re.compile(r"(?m)^\s*([A-Za-z0-9_][\w.\-]*)\s*(?:inherits\s+([\w.\-/ ,]+?))?\s*\{")
 _WRITE_RE = re.compile(r"write(?:_once)?\s*\(\s*\"([^\"]+)\"\s*\)\s*\{")
 
 

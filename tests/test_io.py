@@ -70,3 +70,18 @@ def test_moltemplate_with_import(tmp_path):
     assert len(m.bonds) == 9
     assert m.ff.style("pair_style") == "lj/cut/coul/long ${cutoff}"
     assert m.ff.pair_coeff("CX", "HX") == ["0.0", "0.0"]
+
+
+def test_moltemplate_object_name_starting_with_digit(tmp_path):
+    # ATB residue codes such as "2WOD" may start with a digit
+    p = write_aa(tmp_path)
+    p.write_text(p.read_text().replace("TOY inherits", "2WOD inherits"))
+    m = parse_molecule(p)
+    assert m.name == "2WOD" and m.n_atoms == 10 and m.ff is not None
+
+
+def test_missing_coeffs_are_reported(tmp_path):
+    p = write_aa(tmp_path)
+    p.write_text(p.read_text().replace("$bond:bn @bond:b1", "$bond:bn @bond:b99"))
+    m = parse_molecule(p)
+    assert m.missing_coeffs() == {"bond": ["b99"]}

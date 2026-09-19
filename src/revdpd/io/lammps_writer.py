@@ -102,7 +102,8 @@ def write_lammps(out_dir: str | Path, sets: list[MoleculeSet], box: Box,
     for k in _KINDS:
         missing = [t for t in ttypes[k] if t not in ff.coeffs[k]]
         if missing:
-            raise ValueError(f"force field lacks {k}_coeff for types {missing}")
+            raise ValueError(f"force field {ff.path} lacks {k}_coeff for types {missing}; use the "
+                             "force-field file that belongs to the same ATB revision as the topology")
 
     # ---- atoms and topology
     atom_lines, topo_lines = [], {k: [] for k in _KINDS}
