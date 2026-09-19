@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core.backmap import BackmapSettings, Fitter, estimate_scale, place_cluster
 from ..core.cg_system import CGSystem
-from ..core.lammps_runner import find_lammps
+from ..core.lammps_runner import Cancelled, find_lammps, kill_process_tree
 from ..core.mapping import BeadMapping, atom_owners, auto_linear_mapping, reverse_mapping
 from ..core.pipeline import (
     BUILTIN_SPC, Job, MinimizeSettings, OverlapSettings, Project, SpeciesAssignment, load_template,
@@ -78,20 +78,38 @@ class Worker(QObject):
     progress = Signal(str, int, int)
     done = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
         self.stop_requested = False
+        self.proc = None          # running LAMMPS process, if any
+
+    def set_process(self, proc):
+        self.proc = proc
+        if self.stop_requested:
+            kill_process_tree(proc)
+
+    def request_stop(self):
+        """Called from the GUI thread: stop now, killing LAMMPS if it is running."""
+        self.stop_requested = True
+        if self.proc is not None:
+            kill_process_tree(self.proc)
 
     @Slot()
     def run(self):
         try:
             res = self.fn(self.log.emit, lambda name, i, n: self.progress.emit(name, i, n),
-                          lambda: self.stop_requested)
+                          lambda: self.stop_requested, self.set_process)
             self.done.emit(res)
+        except Cancelled:
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001 - report everything to the GUI
-            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+            if self.stop_requested:
+                self.cancelled.emit()
+            else:
+                self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
 
 
 def _swatch(color: str) -> QIcon:
@@ -300,6 +318,7 @@ class MainWindow(QMainWindow):
             "per-bead shift: additionally translate each atom group onto its bead.\n"
             "per-bead fragments: rotate each bead's atom group towards its neighbour beads and\n"
             "centre it on the bead (follows bent CG molecules; relaxation repairs the joints).")
+        self.cmb_mode.setCurrentIndex(2)
         f4.addRow("Fit", self.cmb_mode)
         self.spn_flex = QDoubleSpinBox()
         self.spn_flex.setRange(0, 1)
@@ -362,9 +381,20 @@ class MainWindow(QMainWindow):
         b.setText("...")
         b.clicked.connect(self.browse_lmp)
         f7.addRow("Executable", _hline(self.ed_lmp, b))
-        self.spn_mpi = QSpinBox()
-        self.spn_mpi.setRange(1, 1024)
-        f7.addRow("MPI ranks", self.spn_mpi)
+        self.ed_prefix = QLineEdit(self.settings.value("lammps_prefix", ""))
+        self.ed_prefix.setPlaceholderText("e.g. mpirun -np 4")
+        self.ed_prefix.setToolTip("Written in front of the LAMMPS executable (MPI launcher)")
+        f7.addRow("Prefix", self.ed_prefix)
+        self.ed_extra = QLineEdit(self.settings.value("lammps_extra", ""))
+        self.ed_extra.setPlaceholderText("e.g. -sf omp -pk omp 8")
+        self.ed_extra.setToolTip("Extra LAMMPS command-line arguments (accelerator packages, -var, ...)")
+        f7.addRow("Arguments", self.ed_extra)
+        self.lbl_cmd = QLabel()
+        self.lbl_cmd.setWordWrap(True)
+        self.lbl_cmd.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        f7.addRow(self.lbl_cmd)
+        for w in (self.ed_lmp, self.ed_prefix, self.ed_extra):
+            w.textChanged.connect(self._update_cmd_preview)
         R.addWidget(self.g_min)
 
         g8 = QGroupBox("Relaxation protocol (written to *.min.in)")
@@ -397,6 +427,15 @@ class MainWindow(QMainWindow):
         self.chk_release = QCheckBox("5. Final minimisation without restraints")
         self.chk_release.setChecked(True)
         f8.addRow(self.chk_release)
+        self.cmb_minstyle = QComboBox()
+        self.cmb_minstyle.addItems(["cg", "sd", "fire", "quickmin", "hftn"])
+        self.cmb_minstyle.setToolTip(
+            "LAMMPS min_style for all minimisations.\n"
+            "cg: conjugate gradient (LAMMPS default, efficient).\n"
+            "sd: steepest descent (robust for very strained starts, slow).\n"
+            "fire / quickmin: damped dynamics, very robust for overlapping structures.\n"
+            "hftn: Hessian-free truncated Newton.")
+        f8.addRow("Min. style", self.cmb_minstyle)
         self.spn_steps = QSpinBox()
         self.spn_steps.setRange(10, 10**7)
         self.spn_steps.setValue(5000)
@@ -469,6 +508,8 @@ class MainWindow(QMainWindow):
         for k in range(9):
             sc = QShortcut(QKeySequence(str(k + 1)), self)
             sc.activated.connect(lambda k=k: self.set_active_bead(k))
+        self.ed_base.textChanged.connect(self._update_cmd_preview)
+        self._update_cmd_preview()
         self.statusBar().showMessage("Load a CG LAMMPS data file to start")
 
     def _build_menu(self):
@@ -1018,7 +1059,7 @@ class MainWindow(QMainWindow):
             restrained=self.chk_restr.isChecked() and bool(self.ed_k.text().split()),
             restraint_k=self.ed_k.text().strip() or "0", md_steps=self.spn_md.value(),
             md_timesteps=self.ed_dt.text().strip() or "1.0", temperature=self.spn_temp.value(),
-            release=self.chk_release.isChecked())
+            release=self.chk_release.isChecked(), min_style=self.cmb_minstyle.currentText())
 
     def _jobs(self):
         jobs, skipped = [], []
@@ -1054,10 +1095,11 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self.error("Invalid relaxation settings", str(exc))
             return
-        mini = MinimizeSettings(enabled=self.g_min.isChecked(), lammps_exe=self.ed_lmp.text().strip(),
-                                mpi=self.spn_mpi.value())
+        mini = self.minimize_settings()
         if mini.enabled:
             self.settings.setValue("lammps_exe", mini.lammps_exe)
+            self.settings.setValue("lammps_prefix", mini.prefix)
+            self.settings.setValue("lammps_extra", mini.extra_args)
         half = 0.5 * float((self.cg.box.lengths * bm.scale).min())
         if outs.cutoff >= half:
             self.error("Cutoff too large", f"Pair cutoff {outs.cutoff} A must be smaller than half the "
@@ -1066,9 +1108,9 @@ class MainWindow(QMainWindow):
         out_dir = self.ed_out.text().strip()
         cg = self.cg
 
-        def task(log, progress, stop):
+        def task(log, progress, stop, on_process):
             return run_backmapping(cg, jobs, bm, ov, outs, out_dir, mini, log=log,
-                                   progress=progress, stop=stop)
+                                   progress=progress, stop=stop, on_process=on_process)
 
         self.thread = QThread(self)
         self.worker = Worker(task)
@@ -1078,8 +1120,10 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self.on_progress)
         self.worker.done.connect(self.on_done)
         self.worker.failed.connect(self.on_failed)
+        self.worker.cancelled.connect(self.on_cancelled)
         self.worker.done.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
+        self.worker.cancelled.connect(self.thread.quit)
         self.thread.finished.connect(lambda: self._busy(False))
         self._busy(True)
         self.log("=" * 60)
@@ -1087,9 +1131,24 @@ class MainWindow(QMainWindow):
         self.thread.start()
 
     def stop(self):
-        if self.worker:
-            self.worker.stop_requested = True
-            self.log("stop requested (takes effect at the next LAMMPS output line)")
+        if self.worker and not self.worker.stop_requested:
+            self.log("stopping ...")
+            self.worker.request_stop()      # kills a running LAMMPS immediately
+
+    def on_cancelled(self):
+        self.progress.setFormat("stopped")
+        self.log("stopped by user" + (" (LAMMPS process terminated)" if self.worker and self.worker.proc else ""))
+
+    def minimize_settings(self) -> MinimizeSettings:
+        return MinimizeSettings(enabled=self.g_min.isChecked(), lammps_exe=self.ed_lmp.text().strip(),
+                                prefix=self.ed_prefix.text().strip(), extra_args=self.ed_extra.text().strip())
+
+    def _update_cmd_preview(self):
+        try:
+            cmd = self.minimize_settings().command(f"{self.ed_base.text().strip() or 'system'}.min.in")
+            self.lbl_cmd.setText("<small><code>" + " ".join(cmd) + "</code></small>")
+        except ValueError as exc:              # unbalanced quotes while typing
+            self.lbl_cmd.setText(f"<small>{exc}</small>")
 
     def _busy(self, on: bool):
         self.btn_run.setEnabled(not on)
@@ -1110,6 +1169,7 @@ class MainWindow(QMainWindow):
                + "\n".join(f"{k}: {v}" for k, v in wr.files.items()))
         if wr.warnings:
             msg += "\n\nWarnings:\n" + "\n".join(wr.warnings)
+        msg += "\n\nRun the relaxation manually with ./run_lammps.sh in the output folder."
         if res.lammps_exit is not None:
             msg += f"\n\nLAMMPS exit code: {res.lammps_exit}"
             if res.lammps_exit == 0:
@@ -1140,8 +1200,7 @@ class MainWindow(QMainWindow):
         p.overlap = OverlapSettings(enabled=self.g_ov.isChecked(), d_min=self.spn_dmin.value(),
                                     max_iter=self.spn_oviter.value(), heavy_only=self.chk_heavy.isChecked())
         p.output = self.output_settings()
-        p.minimize = MinimizeSettings(enabled=self.g_min.isChecked(), lammps_exe=self.ed_lmp.text().strip(),
-                                      mpi=self.spn_mpi.value())
+        p.minimize = self.minimize_settings()
         return p
 
     def save_project(self):
@@ -1201,7 +1260,9 @@ class MainWindow(QMainWindow):
         self.g_min.setChecked(p.minimize.enabled)
         if p.minimize.lammps_exe:
             self.ed_lmp.setText(p.minimize.lammps_exe)
-        self.spn_mpi.setValue(p.minimize.mpi)
+        self.ed_prefix.setText(p.minimize.prefix or (f"mpirun -np {p.minimize.mpi}" if p.minimize.mpi > 1 else ""))
+        self.ed_extra.setText(p.minimize.extra_args)
+        self.cmb_minstyle.setCurrentText(o.min_style)
         self.load_cg()
         if self.cg is None:
             return

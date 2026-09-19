@@ -85,3 +85,27 @@ def test_missing_coeffs_are_reported(tmp_path):
     p.write_text(p.read_text().replace("$bond:bn @bond:b1", "$bond:bn @bond:b99"))
     m = parse_molecule(p)
     assert m.missing_coeffs() == {"bond": ["b99"]}
+
+
+def test_inconsistent_image_flags_are_ignored(tmp_path):
+    # OVITO can write image flags that differ between bonded beads of a whole molecule
+    text, coords = cg_data("angle", images=True, box=12.0)
+    out, in_atoms = [], False
+    for ln in text.splitlines():
+        if ln.startswith("Atoms"):
+            in_atoms = True
+        elif ln.startswith("Bonds"):
+            in_atoms = False
+        elif in_atoms and ln.strip():
+            t = ln.split()
+            if int(t[0]) % 3 == 0:          # corrupt the flag of every third bead
+                t[-1] = str(int(t[-1]) + 1)
+            ln = " ".join(t)
+        out.append(ln)
+    p = tmp_path / "cg.data"
+    p.write_text("\n".join(out))
+    cg = CGSystem(read_lammps_data(p))
+    sp = cg.species[0]
+    for k in range(sp.count):
+        x = cg.instance_coords(sp, k)
+        assert np.allclose(np.linalg.norm(x[1:] - x[:-1], axis=1), 0.5, atol=1e-5)

@@ -128,14 +128,13 @@ class CGSystem:
     def unwrapped(self, rows: np.ndarray) -> np.ndarray:
         """Coordinates of one molecule made whole across periodic boundaries.
 
-        Uses image flags when present; otherwise walks the bond graph and applies the
-        minimum image convention along every bond (atoms not reachable by bonds are
-        placed at the minimum image of the first atom).
+        Walks the bond graph and applies the minimum image convention along every bond;
+        atoms not reachable by bonds are placed at the minimum image of the first atom.
+        Image flags in the data file are deliberately ignored: files written by other
+        tools (e.g. OVITO) can carry flags that are inconsistent within a molecule, while
+        CG bonds are always far shorter than half the box.
         """
         d = self.data
-        if d.has_image_flags and np.any(d.image[rows] != 0):
-            h = self.box.h_matrix()
-            return d.pos[rows] + d.image[rows] @ h.T
         pos = d.pos[rows]
         local = {int(r): k for k, r in enumerate(rows)}
         out = np.full_like(pos, np.nan)

@@ -40,7 +40,7 @@ def test_fit_preserves_orientation(tmp_path):
     rng = np.random.default_rng(3)
     R = random_rotation(rng)
     target = (B @ R.T + [5.0, 6.0, 7.0]) / 4.0       # CG units with scale 4
-    f = Fitter(m, mp, BackmapSettings(scale=4.0, random_spin=False))
+    f = Fitter(m, mp, BackmapSettings(scale=4.0, random_spin=False, mode="rigid"))
     y = f.fit(target, rng)
     assert f.rmsd(target, y) < 1e-6
     # head-to-tail vector points the same way as in the CG molecule
@@ -121,7 +121,7 @@ def test_fragment_mode_follows_bent_molecule(tmp_path):
     bonds = [(0, 1), (1, 2), (2, 3)]
     rng = np.random.default_rng(7)
     x = _bent_target(m, mp, 4.0, rng)
-    rig = Fitter(m, mp, BackmapSettings(scale=4.0, random_spin=False), bonds)
+    rig = Fitter(m, mp, BackmapSettings(scale=4.0, random_spin=False, mode="rigid"), bonds)
     frg = Fitter(m, mp, BackmapSettings(scale=4.0, random_spin=False, mode="fragment"), bonds)
     r_rigid = rig.rmsd(x, rig.fit(x, rng))
     y = frg.fit(x, rng)

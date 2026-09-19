@@ -17,7 +17,8 @@ Optionally it removes overlaps and minimises the result with LAMMPS.
   image flags and triclinic boxes are handled
   ([LAMMPS `read_data` format](https://docs.lammps.org/read_data.html)).
 - Splits the system into molecules (by molecule ID or bond connectivity), makes
-  them whole across periodic boundaries and groups identical molecules into species.
+  them whole across periodic boundaries (along the bonds; image flags in the file are
+  not trusted) and groups identical molecules into species.
 - Reads all-atom templates with force field from **moltemplate** `.lt` files, e.g.
   as produced by the [Automated Topology Builder (ATB)](https://atb.uq.edu.au). The
   force-field file (`GROMOS_54A7_ATB.lt` …) is located automatically in the same
@@ -107,8 +108,12 @@ double-click on empty space resets the view.
 | `system.in.init` | units and styles taken from the force field |
 | `system.in.settings` | includes `system.in.bonded` and `system.in.pair` |
 | `system.min.in` | restrained, gradual relaxation → `system_min.data` |
+| `run_lammps.sh` | the exact LAMMPS command used by the GUI (prefix, executable, arguments) |
 
-Run it yourself with `lmp -in system.min.in` inside the output folder.
+Run it yourself with `./run_lammps.sh` (or `lmp -in system.min.in`) inside the output
+folder. In the GUI the command is built as `[prefix] lmp -in system.min.in [arguments]`,
+e.g. prefix `mpirun -np 4` and arguments `-sf omp -pk omp 8`; *Stop* terminates LAMMPS
+(including MPI ranks) immediately.
 
 ## Method
 
@@ -154,6 +159,11 @@ contacts, then remaining pairs are pushed apart by rigid-body translations.
 4. restrained Langevin MD with increasing time step (default 0.2, 0.5, 1 fs;
    `fix nve/limit`);
 5. final minimisation without restraints.
+
+All minimisations use the selected `min_style` (default `cg`, LAMMPS' conjugate gradient;
+`sd`, `fire`, `quickmin` and `hftn` can be chosen). The neighbour skin is 1 Å and stage 1
+uses a 2 Å dummy cutoff to keep memory low; the log reports an estimate of the neighbour
+list memory, which grows with the number of atoms and (cutoff + skin)³.
 
 During stages 1–4 the heavy atoms of the back-mapped solutes are tied to their
 back-mapped positions with `fix spring/self` (the reference stays fixed while the

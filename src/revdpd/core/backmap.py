@@ -13,7 +13,7 @@ from .mapping import BeadMapping, atom_owners, bead_centers
 @dataclass
 class BackmapSettings:
     scale: float = 10.0            # Angstrom per CG length unit
-    mode: str = "rigid"            # "rigid" | "flex" | "fragment"
+    mode: str = "fragment"         # "rigid" | "flex" | "fragment"
     flex_weight: float = 1.0       # fraction of the per-bead residual applied in flex mode
     random_spin: bool = True       # randomise rotation about the axis of (near-)linear molecules
     linear_threshold: float = 0.15  # s2/s1 of bead centres below which a molecule counts as linear
@@ -251,15 +251,16 @@ def _align_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def backmap_species(cg: CGSystem, species: CGSpecies, mol: AAMolecule, mapping: BeadMapping,
                     settings: BackmapSettings, rng: np.random.Generator | None = None,
-                    progress=None, copies: int = 1) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+                    progress=None, copies: int = 1, stop=None) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Fit the template onto every instance.
 
     ``copies`` > 1 is allowed for single-bead species only: every bead is replaced by
     that many molecules (e.g. N_m water molecules per DPD water bead).
 
     Returns (coords per all-atom molecule, bead RMSD per CG molecule, linear flag per
-    all-atom molecule).
+    all-atom molecule). ``stop()`` returning True aborts with :class:`Cancelled`.
     """
+    from .lammps_runner import Cancelled
     if mapping.n_beads != species.n_beads:
         raise ValueError(f"mapping has {mapping.n_beads} beads but species has {species.n_beads}")
     if copies > 1 and species.n_beads != 1:
@@ -271,8 +272,11 @@ def backmap_species(cg: CGSystem, species: CGSpecies, mol: AAMolecule, mapping: 
         for k in range(n):
             x = cg.instance_coords(species, k)[0] * settings.scale
             out += place_cluster(x, mol, copies, rng)
-            if progress and (k % 500 == 0 or k == n - 1):
-                progress(k + 1, n)
+            if k % 500 == 0 or k == n - 1:
+                if stop and stop():
+                    raise Cancelled("stopped by user")
+                if progress:
+                    progress(k + 1, n)
         return out, np.zeros(n), np.zeros(len(out), dtype=bool)
     fitter = Fitter(mol, mapping, settings, species.bonds)
     for k in range(n):
@@ -281,6 +285,9 @@ def backmap_species(cg: CGSystem, species: CGSpecies, mol: AAMolecule, mapping: 
         out.append(y)
         rmsd.append(fitter.rmsd(x, y))
         lin.append(fitter.instance_is_linear(x))
-        if progress and (k % 50 == 0 or k == n - 1):
-            progress(k + 1, n)
+        if k % 50 == 0 or k == n - 1:
+            if stop and stop():
+                raise Cancelled("stopped by user")
+            if progress:
+                progress(k + 1, n)
     return out, np.array(rmsd), np.array(lin)

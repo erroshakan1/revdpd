@@ -49,3 +49,30 @@ def test_restrained_relaxation_with_water(tmp_path, mode):
     d = read_lammps_data(tmp_path / "out" / "system_min.data", "full")
     assert d.n_atoms == 12 * aa.n_atoms + 90 * 3
     assert np.isfinite(d.pos).all()
+
+
+def test_kill_process_tree_stops_child_immediately(tmp_path):
+    import threading
+    import time
+
+    from revdpd.core.lammps_runner import kill_process_tree, run_lammps
+    procs = []
+    t0 = time.time()
+    th = threading.Thread(target=lambda: procs.append(
+        run_lammps(["sh", "-c", "sleep 60 & sleep 60; wait"], tmp_path, log=lambda *_: None,
+                   on_start=procs.append)))
+    th.start()
+    while not procs:
+        time.sleep(0.01)
+    kill_process_tree(procs[0])
+    th.join(10)
+    assert not th.is_alive() and time.time() - t0 < 5
+    assert procs[0].poll() is not None
+
+
+def test_build_command():
+    from revdpd.core.lammps_runner import build_command
+    assert build_command("lmp", "s.in") == ["lmp", "-in", "s.in"]
+    assert build_command("lmp", "s.in", "mpirun -np 4", "-sf omp -pk omp 2") == \
+        ["mpirun", "-np", "4", "lmp", "-in", "s.in", "-sf", "omp", "-pk", "omp", "2"]
+    assert build_command("lmp", "s.in", mpi=3)[:3] == ["mpirun", "-np", "3"]

@@ -37,7 +37,7 @@ def remove_overlaps(mols: list[np.ndarray], masks: list[np.ndarray], box: Box,
                     d_min: float = 2.5, max_iter: int = 60, max_step: float = 1.0,
                     spin: list[bool] | None = None, n_spin: int = 12,
                     rng: np.random.Generator | None = None, log=None,
-                    margin: float = 1.1) -> list[np.ndarray]:
+                    margin: float = 1.1, stop=None) -> list[np.ndarray]:
     """Push overlapping molecules apart as rigid bodies.
 
     ``mols`` are per-molecule coordinates (Angstrom, unwrapped); ``masks`` select the
@@ -48,6 +48,12 @@ def remove_overlaps(mols: list[np.ndarray], masks: list[np.ndarray], box: Box,
     """
     if box.triclinic:
         raise ValueError("overlap removal currently supports orthogonal boxes only")
+    from .lammps_runner import Cancelled
+
+    def check():
+        if stop and stop():
+            raise Cancelled("stopped by user")
+
     rng = rng or np.random.default_rng(0)
     mols = [m.copy() for m in mols]
     L = box.lengths
@@ -65,7 +71,9 @@ def remove_overlaps(mols: list[np.ndarray], masks: list[np.ndarray], box: Box,
         tree = cKDTree(_wrap(X, box), boxsize=L)
         angles = np.linspace(0, 2 * np.pi, n_spin, endpoint=False)
         changed = 0
-        for i in involved:
+        for n_done, i in enumerate(involved):
+            if n_done % 200 == 0:
+                check()
             if not spin[i]:
                 continue
             m = mols[i]
@@ -90,6 +98,7 @@ def remove_overlaps(mols: list[np.ndarray], masks: list[np.ndarray], box: Box,
 
     # ---- stage 2: rigid translations
     for it in range(max_iter):
+        check()
         if len(pairs) == 0:
             break
         d = X[pairs[:, 0]] - X[pairs[:, 1]]

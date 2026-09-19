@@ -42,6 +42,8 @@ class OutputSettings:
     md_timesteps: str = "0.2 0.5 1.0"  # fs, one restrained MD stage per value
     temperature: float = 300.0
     release: bool = True          # final minimisation without restraints
+    min_style: str = "cg"         # LAMMPS min_style: cg (default), sd, fire, quickmin, hftn
+    skin: float = 1.0             # neighbour skin (A); smaller than LAMMPS' 2 A to save memory
     seed: int = 4928459
 
 
@@ -229,7 +231,8 @@ def relaxation_script(b: str, init: list[str], pair_style: str, kspace: str | No
     R = [f"# restrained relaxation of the back-mapped structure (revdpd {__version__})", ""]
     R += init
     R += ["", f"read_data {b}.data", f"include {b}.in.bonded",
-          "neigh_modify delay 0 every 1 check yes one 5000", "thermo 100", ""]
+          f"neighbor {st.skin:g} bin", "neigh_modify delay 0 every 1 check yes one 5000",
+          f"min_style {st.min_style}", "thermo 100", ""]
     if n_restr:
         R += ["# position restraints on heavy atoms of the back-mapped molecules",
               f"group solute molecule 1:{n_restr}",
@@ -241,8 +244,9 @@ def relaxation_script(b: str, init: list[str], pair_style: str, kspace: str | No
     R += ["thermo_style custom step temp pe ebond eangle edihed evdwl ecoul elong "
           + ("f_posres " if n_restr else "") + "press", ""]
     if st.bonded_stage:
+        # a short cutoff keeps the (unused) neighbour list small
         R += ["# --- stage 1: bonded terms only",
-              f"pair_style zero {st.cutoff:g}", "pair_coeff * *",
+              "pair_style zero 2.0", "pair_coeff * *",
               mn, "reset_timestep 0", ""]
     if st.soft_stage:
         R += ["# --- stage 2: soft push-off (removes overlaps without infinite forces)",

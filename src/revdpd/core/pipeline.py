@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -23,7 +25,7 @@ def load_template(aa_path: str, ff_path: str | None) -> AAMolecule:
     return parse_molecule(aa_path, ff_path)
 from .backmap import BackmapSettings, backmap_species
 from .cg_system import CGSpecies, CGSystem
-from .lammps_runner import find_lammps, run_lammps
+from .lammps_runner import Cancelled, build_command, find_lammps, run_lammps
 from .mapping import BeadMapping
 from .overlap import remove_overlaps
 
@@ -53,7 +55,13 @@ class OverlapSettings:
 class MinimizeSettings:
     enabled: bool = False
     lammps_exe: str = ""
-    mpi: int = 1
+    mpi: int = 1                     # legacy; used only when prefix is empty
+    prefix: str = ""                 # e.g. "mpirun -np 4"
+    extra_args: str = ""             # e.g. "-sf omp -pk omp 8"
+
+    def command(self, script: str) -> list[str]:
+        return build_command(self.lammps_exe or find_lammps() or "lmp", script,
+                             self.prefix, self.extra_args, self.mpi)
 
 
 @dataclass
@@ -128,8 +136,12 @@ class Job:
 
 def run_backmapping(cg: CGSystem, jobs: list, bm: BackmapSettings, ov: OverlapSettings,
                     outset: OutputSettings, out_dir: str | Path, mini: MinimizeSettings | None = None,
-                    log=print, progress=None, stop=None) -> BackmapResult:
-    """``jobs``: :class:`Job` objects or (species, molecule, mapping[, copies]) tuples."""
+                    log=print, progress=None, stop=None, on_process=None) -> BackmapResult:
+    """``jobs``: :class:`Job` objects or (species, molecule, mapping[, copies]) tuples.
+
+    ``stop()`` returning True aborts with :class:`Cancelled`; ``on_process(proc)`` receives
+    the LAMMPS process so the caller can kill it.
+    """
     jobs = [j if isinstance(j, Job) else Job(*j) for j in jobs]
     # molecules placed one per CG molecule are restrained and written first; solvent last
     jobs.sort(key=lambda j: j.copies > 1)
@@ -143,7 +155,7 @@ def run_backmapping(cg: CGSystem, jobs: list, bm: BackmapSettings, ov: OverlapSe
             log(f"placing {j.copies} x {mol.name} per bead on {sp.count} x {sp.name}")
         else:
             log(f"fitting {mol.name} onto {sp.count} x {sp.name} ({bm.mode} fit)")
-        coords, r, lin = backmap_species(cg, sp, mol, j.mapping, bm, rng, copies=j.copies,
+        coords, r, lin = backmap_species(cg, sp, mol, j.mapping, bm, rng, copies=j.copies, stop=stop,
                                          progress=(lambda i, n, name=sp.name: progress(name, i, n))
                                          if progress else None)
         if j.copies == 1:
@@ -160,26 +172,58 @@ def run_backmapping(cg: CGSystem, jobs: list, bm: BackmapSettings, ov: OverlapSe
         masks = [s.template.heavy_mask() if ov.heavy_only else np.ones(s.template.n_atoms, bool)
                  for s in sets for _ in s.coords]
         fixed = remove_overlaps(allc, masks, box, d_min=ov.d_min, max_iter=ov.max_iter,
-                                spin=spin_flags, rng=rng, log=log)
+                                spin=spin_flags, rng=rng, log=log, stop=stop)
         k = 0
         for s in sets:
             s.coords = fixed[k:k + len(s.coords)]
             k += len(s.coords)
 
+    if stop and stop():
+        raise Cancelled("stopped by user")
     wr = write_lammps(out_dir, sets, box, outset)
     log(f"wrote {wr.n_atoms} atoms in {wr.n_molecules} molecules to {Path(out_dir).resolve()}")
     for w in wr.warnings:
         log("WARNING: " + w)
+    mem = neighbor_memory_gb(wr.n_atoms, float(np.prod(box.lengths)), outset.cutoff, outset.skin)
+    log(f"estimated LAMMPS neighbour-list memory: {mem:.1f} GB in total "
+        f"(cutoff {outset.cutoff:g} A + skin {outset.skin:g} A; split across MPI ranks)")
+    avail = _available_memory_gb()
+    if avail and mem > 0.7 * avail:
+        log(f"WARNING: this is close to or above the available memory ({avail:.0f} GB); "
+            "reduce the pair cutoff for the relaxation or run on more nodes")
+    mini = mini or MinimizeSettings()
+    cmd = mini.command(wr.files["run"].name)
+    sh = Path(out_dir) / "run_lammps.sh"
+    sh.write_text("#!/bin/sh\n# run the relaxation (written by revdpd)\ncd \"$(dirname \"$0\")\"\n"
+                  + " ".join(shlex.quote(c) for c in cmd) + " -log log.lammps\n")
+    sh.chmod(0o755)
+    wr.files["script"] = sh
     res = BackmapResult(sets=sets, rmsd=rmsd, write=wr)
 
-    if mini and mini.enabled:
-        exe = mini.lammps_exe or find_lammps()
-        if not exe:
-            log("ERROR: LAMMPS executable not found; skipping minimisation")
+    if mini.enabled:
+        if not (mini.lammps_exe or find_lammps()):
+            log("ERROR: LAMMPS executable not found; skipping the relaxation")
         else:
-            res.lammps_exit = run_lammps(exe, wr.files["run"], Path(out_dir), log=log, mpi=mini.mpi, stop=stop)
+            res.lammps_exit = run_lammps(cmd + ["-log", "log.lammps"], Path(out_dir), log=log,
+                                         on_start=on_process)
+            if stop and stop():
+                raise Cancelled("LAMMPS was stopped by user")
             log(f"LAMMPS finished with exit code {res.lammps_exit}")
     return res
+
+
+def neighbor_memory_gb(n_atoms: int, volume: float, cutoff: float, skin: float) -> float:
+    """Rough size of a LAMMPS half neighbour list (4 bytes per pair, 30 % page overhead)."""
+    rho = n_atoms / volume
+    pairs = n_atoms * 0.5 * rho * 4.0 / 3.0 * np.pi * (cutoff + skin) ** 3
+    return float(pairs * 4 * 1.3 / 1e9)
+
+
+def _available_memory_gb() -> float | None:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+    except (ValueError, OSError, AttributeError):
+        return None
 
 
 def run_project(project: Project, log=print) -> BackmapResult:
