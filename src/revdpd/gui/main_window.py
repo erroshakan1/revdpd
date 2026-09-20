@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
@@ -53,6 +53,8 @@ template with CG bond lengths. Tick <i>Overlay fit</i> to preview the fitted mol
 <li><b>Run</b>: every mapped species is fitted onto all its CG molecules (Kabsch fit of the bead
 centres - the orientation of every molecule is kept), optional rigid-body overlap removal,
 LAMMPS files are written together with a restrained, gradual relaxation script
+(always written; tick <i>Run it now with LAMMPS</i> in the <i>Relaxation</i> section to start it
+directly, or run <code>run_lammps.sh</code> in the output folder later)
 (bonded-only minimisation, soft push-off, minimisations with decreasing position restraints,
 restrained MD with increasing time step, final unrestrained minimisation), which can be run
 directly.</li>
@@ -408,33 +410,76 @@ class MainWindow(QMainWindow):
         fi.addRow("Min. distance", self.spn_dsol)
         R.addWidget(g_ion)
 
-        g6 = self._section("Output")
-        f6 = QFormLayout(g6.content)
-        self.ed_out = QLineEdit(str(Path.cwd() / "backmapped"))
-        b = QToolButton()
-        b.setText("...")
-        b.clicked.connect(self.browse_out)
-        f6.addRow("Folder", _hline(self.ed_out, b))
-        self.ed_base = QLineEdit("system")
-        f6.addRow("Base name", self.ed_base)
+        g7 = self._section("Relaxation (LAMMPS)")
+        f7 = QFormLayout(g7.content)
+        note = QLabel("The relaxation script is always written to the output folder. "
+                      "Tick <i>Run it now</i> to let revdpd start LAMMPS directly.")
+        note.setWordWrap(True)
+        f7.addRow(note)
         self.spn_cut = QDoubleSpinBox()
         self.spn_cut.setRange(4, 30)
         self.spn_cut.setValue(14.0)
         self.spn_cut.setSuffix(" A")
-        f6.addRow("Pair cutoff", self.spn_cut)
+        self.spn_cut.setToolTip("Pair cutoff written to the init file and used by the relaxation")
+        f7.addRow("Pair cutoff", self.spn_cut)
         self.chk_long = QCheckBox("Long-range electrostatics (kspace)")
         self.chk_long.setChecked(True)
-        f6.addRow(self.chk_long)
-        R.addWidget(g6)
+        f7.addRow(self.chk_long)
+        self.chk_bonded = QCheckBox("1. Bonded-only minimisation")
+        self.chk_bonded.setChecked(True)
+        f7.addRow(self.chk_bonded)
+        self.chk_soft = QCheckBox("2. Soft-potential push-off")
+        self.chk_soft.setChecked(True)
+        f7.addRow(self.chk_soft)
+        self.chk_restr = QCheckBox("Restrain heavy atoms to back-mapped positions")
+        self.chk_restr.setChecked(True)
+        f7.addRow(self.chk_restr)
+        self.ed_k = QLineEdit("1000 100 10")
+        self.ed_k.setToolTip("3. One full-force-field minimisation per restraint constant (kcal/mol/A^2)")
+        f7.addRow("3. Restraint k", self.ed_k)
+        self.spn_md = QSpinBox()
+        self.spn_md.setRange(0, 10**7)
+        self.spn_md.setValue(1000)
+        self.spn_md.setToolTip("4. Restrained MD steps per time step value (0 = no MD)")
+        f7.addRow("4. MD steps / stage", self.spn_md)
+        self.ed_dt = QLineEdit("0.2 0.5 1.0")
+        self.ed_dt.setToolTip("Time steps (fs) of the successive restrained MD stages")
+        f7.addRow("    Time steps (fs)", self.ed_dt)
+        self.spn_temp = QDoubleSpinBox()
+        self.spn_temp.setRange(1, 2000)
+        self.spn_temp.setValue(300)
+        self.spn_temp.setSuffix(" K")
+        f7.addRow("    Temperature", self.spn_temp)
+        self.chk_release = QCheckBox("5. Final minimisation without restraints")
+        self.chk_release.setChecked(True)
+        f7.addRow(self.chk_release)
+        self.cmb_minstyle = QComboBox()
+        self.cmb_minstyle.addItems(["cg", "sd", "fire", "quickmin", "hftn"])
+        self.cmb_minstyle.setToolTip(
+            "LAMMPS min_style for all minimisations.\n"
+            "cg: conjugate gradient (LAMMPS default, efficient).\n"
+            "sd: steepest descent (robust for very strained starts, slow).\n"
+            "fire / quickmin: damped dynamics, very robust for overlapping structures.\n"
+            "hftn: Hessian-free truncated Newton.")
+        f7.addRow("Min. style", self.cmb_minstyle)
+        self.spn_steps = QSpinBox()
+        self.spn_steps.setRange(10, 10**7)
+        self.spn_steps.setValue(5000)
+        f7.addRow("Max. min. iterations", self.spn_steps)
 
-        self.g_min = self._section("Run relaxation with LAMMPS", checkable=True)
-        self.g_min.setChecked(False)
-        f7 = QFormLayout(self.g_min.content)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        f7.addRow(line)
+        self.g_min = QCheckBox("Run it now with LAMMPS")
+        self.g_min.setToolTip("Start LAMMPS on the written script as soon as the structure is ready")
+        f7.addRow(self.g_min)
         self.ed_lmp = QLineEdit(self.settings.value("lammps_exe", "") or (find_lammps() or ""))
         b = QToolButton()
         b.setText("...")
         b.clicked.connect(self.browse_lmp)
-        f7.addRow("Executable", _hline(self.ed_lmp, b))
+        self.row_exe = _hline(self.ed_lmp, b)
+        f7.addRow("Executable", self.row_exe)
         self.ed_prefix = QLineEdit(self.settings.value("lammps_prefix", ""))
         self.ed_prefix.setPlaceholderText("e.g. mpirun -np 4")
         self.ed_prefix.setToolTip("Written in front of the LAMMPS executable (MPI launcher)")
@@ -449,52 +494,21 @@ class MainWindow(QMainWindow):
         f7.addRow(self.lbl_cmd)
         for w in (self.ed_lmp, self.ed_prefix, self.ed_extra):
             w.textChanged.connect(self._update_cmd_preview)
-        R.addWidget(self.g_min)
+        self.g_min.toggled.connect(self._update_run_row)
+        self.g_min.setChecked(False)
+        self._update_run_row(False)
+        R.addWidget(g7)
 
-        g8 = self._section("Relaxation protocol (written to *.min.in)", collapsed=True)
-        f8 = QFormLayout(g8.content)
-        self.chk_bonded = QCheckBox("1. Bonded-only minimisation")
-        self.chk_bonded.setChecked(True)
-        f8.addRow(self.chk_bonded)
-        self.chk_soft = QCheckBox("2. Soft-potential push-off")
-        self.chk_soft.setChecked(True)
-        f8.addRow(self.chk_soft)
-        self.chk_restr = QCheckBox("Restrain heavy atoms to back-mapped positions")
-        self.chk_restr.setChecked(True)
-        f8.addRow(self.chk_restr)
-        self.ed_k = QLineEdit("1000 100 10")
-        self.ed_k.setToolTip("3. One full-force-field minimisation per restraint constant (kcal/mol/A^2)")
-        f8.addRow("3. Restraint k", self.ed_k)
-        self.spn_md = QSpinBox()
-        self.spn_md.setRange(0, 10**7)
-        self.spn_md.setValue(1000)
-        self.spn_md.setToolTip("4. Restrained MD steps per time step value (0 = no MD)")
-        f8.addRow("4. MD steps / stage", self.spn_md)
-        self.ed_dt = QLineEdit("0.2 0.5 1.0")
-        self.ed_dt.setToolTip("Time steps (fs) of the successive restrained MD stages")
-        f8.addRow("    Time steps (fs)", self.ed_dt)
-        self.spn_temp = QDoubleSpinBox()
-        self.spn_temp.setRange(1, 2000)
-        self.spn_temp.setValue(300)
-        self.spn_temp.setSuffix(" K")
-        f8.addRow("    Temperature", self.spn_temp)
-        self.chk_release = QCheckBox("5. Final minimisation without restraints")
-        self.chk_release.setChecked(True)
-        f8.addRow(self.chk_release)
-        self.cmb_minstyle = QComboBox()
-        self.cmb_minstyle.addItems(["cg", "sd", "fire", "quickmin", "hftn"])
-        self.cmb_minstyle.setToolTip(
-            "LAMMPS min_style for all minimisations.\n"
-            "cg: conjugate gradient (LAMMPS default, efficient).\n"
-            "sd: steepest descent (robust for very strained starts, slow).\n"
-            "fire / quickmin: damped dynamics, very robust for overlapping structures.\n"
-            "hftn: Hessian-free truncated Newton.")
-        f8.addRow("Min. style", self.cmb_minstyle)
-        self.spn_steps = QSpinBox()
-        self.spn_steps.setRange(10, 10**7)
-        self.spn_steps.setValue(5000)
-        f8.addRow("Max. min. iterations", self.spn_steps)
-        R.addWidget(g8)
+        g6 = self._section("Output")
+        f6 = QFormLayout(g6.content)
+        self.ed_out = QLineEdit(str(Path.cwd() / "backmapped"))
+        b = QToolButton()
+        b.setText("...")
+        b.clicked.connect(self.browse_out)
+        f6.addRow("Folder", _hline(self.ed_out, b))
+        self.ed_base = QLineEdit("system")
+        f6.addRow("Base name", self.ed_base)
+        R.addWidget(g6)
 
         self.btn_run = QPushButton("Back-map system")
         self.btn_run.setMinimumHeight(36)
@@ -1245,6 +1259,11 @@ class MainWindow(QMainWindow):
     def minimize_settings(self) -> MinimizeSettings:
         return MinimizeSettings(enabled=self.g_min.isChecked(), lammps_exe=self.ed_lmp.text().strip(),
                                 prefix=self.ed_prefix.text().strip(), extra_args=self.ed_extra.text().strip())
+
+    def _update_run_row(self, on: bool):
+        """Only the command widgets depend on 'Run it now'; the protocol is always written."""
+        for w in (self.row_exe, self.ed_prefix, self.ed_extra, self.lbl_cmd):
+            w.setEnabled(on)
 
     def _update_cmd_preview(self):
         try:

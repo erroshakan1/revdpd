@@ -99,8 +99,12 @@ revdpd run project.json [--out DIR] [--minimize]     # run a saved project witho
 4. **Scale** – press *Estimate* (or enter the length of one DPD unit in Å). With
    *Overlay fit* the fitted template is drawn on top of the CG molecule; browse
    molecules with the spin box. The bead-fit RMSD is shown in the corner.
-5. **Back-map system** – writes the files to the output folder and, if enabled, runs
-   the LAMMPS minimisation.
+5. **Relaxation** – the *Relaxation (LAMMPS)* section holds the pair cutoff and the stages
+   of the relaxation script, which is always written. Tick *Run it now with LAMMPS* to start
+   it immediately (executable, MPI prefix and extra arguments are next to the tick box);
+   otherwise run `run_lammps.sh` in the output folder whenever you like.
+6. **Back-map system** – writes the files to the output folder and, if enabled, runs
+   the relaxation.
 
 The atoms of a bead can also be typed directly into the *Atoms* column of the mapping
 table (names separated by spaces or commas). Sections of the back-mapping panel fold away
