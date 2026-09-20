@@ -29,6 +29,7 @@ from ..io.lammps_data import read_lammps_data
 from ..io.lammps_writer import OutputSettings
 from ..io.moltemplate import AAMolecule, parse_forcefield, parse_molecule, spc_water
 from .mol_view import MoleculeView
+from .widgets import CollapsibleGroup, NoWheelFilter, block_wheel
 
 BEAD_COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6",
                "#bfef45", "#469990", "#9a6324", "#800000", "#808000", "#000075", "#fabed4",
@@ -152,6 +153,16 @@ class MainWindow(QMainWindow):
         self._set_species_widgets_enabled(False)
 
     # ================================================================== UI
+    def _section(self, title: str, checkable: bool = False, collapsed: bool = False) -> CollapsibleGroup:
+        """A collapsible panel section that remembers whether it was folded away."""
+        key = f"collapsed/{title}"
+        saved = self.settings.value(key)
+        if saved is not None:
+            collapsed = saved in (True, "true", "True", 1, "1")
+        g = CollapsibleGroup(title, checkable=checkable, collapsed=collapsed)
+        g.arrow.clicked.connect(lambda on, k=key: self.settings.setValue(k, not on))
+        return g
+
     def _build_ui(self):
         # ---------- central: two viewers
         self.aa_view = MoleculeView()
@@ -265,7 +276,8 @@ class MainWindow(QMainWindow):
         self.tbl_beads.setHorizontalHeaderLabels(["Bead", "Type", "Atoms"])
         self.tbl_beads.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_beads.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.tbl_beads.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_beads.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.tbl_beads.itemChanged.connect(self.on_bead_atoms_edited)
         self.tbl_beads.verticalHeader().setVisible(False)
         self.tbl_beads.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.tbl_beads.setMinimumHeight(170)
@@ -304,8 +316,8 @@ class MainWindow(QMainWindow):
         # ---------- right dock: back-mapping
         right = QWidget()
         R = QVBoxLayout(right)
-        g4 = QGroupBox("Placement")
-        f4 = QFormLayout(g4)
+        g4 = self._section("Placement")
+        f4 = QFormLayout(g4.content)
         self.spn_scale = QDoubleSpinBox()
         self.spn_scale.setRange(0.01, 1000)
         self.spn_scale.setDecimals(3)
@@ -328,7 +340,14 @@ class MainWindow(QMainWindow):
         self.spn_flex.setRange(0, 1)
         self.spn_flex.setSingleStep(0.1)
         self.spn_flex.setValue(1.0)
-        f4.addRow("Shift weight", self.spn_flex)
+        self.spn_flex.setToolTip("Only used by 'rigid + per-bead shift': fraction of the residual by "
+                                 "which each atom group is moved onto its bead (1 = exactly on it)")
+        self.lbl_flex = QLabel("Shift weight")
+        f4.addRow(self.lbl_flex, self.spn_flex)
+        self.cmb_mode.currentIndexChanged.connect(
+            lambda i: (self.spn_flex.setEnabled(i == 1), self.lbl_flex.setEnabled(i == 1)))
+        self.spn_flex.setEnabled(False)
+        self.lbl_flex.setEnabled(False)
         self.chk_spin = QCheckBox("Random spin about axis of linear molecules")
         self.chk_spin.setChecked(True)
         f4.addRow(self.chk_spin)
@@ -338,10 +357,9 @@ class MainWindow(QMainWindow):
         f4.addRow("Random seed", self.spn_seed)
         R.addWidget(g4)
 
-        self.g_ov = QGroupBox("Overlap removal (rigid bodies)")
-        self.g_ov.setCheckable(True)
+        self.g_ov = self._section("Overlap removal (rigid bodies)", checkable=True)
         self.g_ov.setChecked(True)
-        f5 = QFormLayout(self.g_ov)
+        f5 = QFormLayout(self.g_ov.content)
         self.spn_dmin = QDoubleSpinBox()
         self.spn_dmin.setRange(0.5, 6)
         self.spn_dmin.setSingleStep(0.1)
@@ -357,8 +375,8 @@ class MainWindow(QMainWindow):
         f5.addRow(self.chk_heavy)
         R.addWidget(self.g_ov)
 
-        g_ion = QGroupBox("Ions (replace water molecules)")
-        fi = QFormLayout(g_ion)
+        g_ion = self._section("Ions (replace water molecules)")
+        fi = QFormLayout(g_ion.content)
         self.chk_neutral = QCheckBox("Neutralise the system (counter-ions)")
         self.chk_neutral.setToolTip("Adds as many cations/anions as needed to make the total charge zero")
         fi.addRow(self.chk_neutral)
@@ -387,8 +405,8 @@ class MainWindow(QMainWindow):
         fi.addRow("Min. distance", self.spn_dsol)
         R.addWidget(g_ion)
 
-        g6 = QGroupBox("Output")
-        f6 = QFormLayout(g6)
+        g6 = self._section("Output")
+        f6 = QFormLayout(g6.content)
         self.ed_out = QLineEdit(str(Path.cwd() / "backmapped"))
         b = QToolButton()
         b.setText("...")
@@ -406,10 +424,9 @@ class MainWindow(QMainWindow):
         f6.addRow(self.chk_long)
         R.addWidget(g6)
 
-        self.g_min = QGroupBox("Run relaxation with LAMMPS")
-        self.g_min.setCheckable(True)
+        self.g_min = self._section("Run relaxation with LAMMPS", checkable=True)
         self.g_min.setChecked(False)
-        f7 = QFormLayout(self.g_min)
+        f7 = QFormLayout(self.g_min.content)
         self.ed_lmp = QLineEdit(self.settings.value("lammps_exe", "") or (find_lammps() or ""))
         b = QToolButton()
         b.setText("...")
@@ -431,8 +448,8 @@ class MainWindow(QMainWindow):
             w.textChanged.connect(self._update_cmd_preview)
         R.addWidget(self.g_min)
 
-        g8 = QGroupBox("Relaxation protocol (written to *.min.in)")
-        f8 = QFormLayout(g8)
+        g8 = self._section("Relaxation protocol (written to *.min.in)", collapsed=True)
+        f8 = QFormLayout(g8.content)
         self.chk_bonded = QCheckBox("1. Bonded-only minimisation")
         self.chk_bonded.setChecked(True)
         f8.addRow(self.chk_bonded)
@@ -544,6 +561,9 @@ class MainWindow(QMainWindow):
             sc.activated.connect(lambda k=k: self.set_active_bead(k))
         self.ed_base.textChanged.connect(self._update_cmd_preview)
         self._update_cmd_preview()
+        self._nowheel = NoWheelFilter(self)
+        block_wheel(dl, self._nowheel)        # setup panel
+        block_wheel(dr, self._nowheel)        # back-mapping panel
         self.statusBar().showMessage("Load a CG LAMMPS data file to start")
 
     def _build_menu(self):
@@ -887,6 +907,31 @@ class MainWindow(QMainWindow):
         self.active_bead = k
         self.refresh_all(reset=False)
 
+    def on_bead_atoms_edited(self, item: QTableWidgetItem):
+        """The atoms of a bead were typed into the table."""
+        st = self.state
+        if item.column() != 2 or st is None or st.aa is None or st.mapping is None:
+            return
+        names = [n for n in item.text().replace(",", " ").split() if n]
+        index = {n: i for i, n in enumerate(st.aa.atom_names)}
+        unknown = [n for n in names if n not in index]
+        heavy = st.aa.heavy_mask()
+        light = [n for n in names if n in index and not heavy[index[n]]]
+        if unknown or light:
+            msg = ""
+            if unknown:
+                msg += f"Unknown atoms: {', '.join(unknown)}.\n"
+            if light:
+                msg += f"Hydrogens cannot be mapped (they follow their heavy atom): {', '.join(light)}."
+            self.error("Cannot use these atom names", msg)
+            self.refresh_bead_table()
+            return
+        st.mapping.clear(item.row())
+        st.mapping.assign(item.row(), [index[n] for n in names])
+        self.log(f"bead {item.row() + 1}: " + (" ".join(names) or "(empty)"))
+        self._update_species_row(self.cur)
+        self.refresh_all(reset=False)
+
     def on_bead_row_selected(self):
         rows = self.tbl_beads.selectionModel().selectedRows()
         if rows and rows[0].row() != self.active_bead:
@@ -956,11 +1001,19 @@ class MainWindow(QMainWindow):
                 it = QTableWidgetItem(f"{k + 1}")
                 it.setIcon(_swatch(BEAD_COLORS[k % len(BEAD_COLORS)]))
                 t.setItem(k, 0, it)
-                t.setItem(k, 1, QTableWidgetItem(sp.bead_names[k]))
+                ty = QTableWidgetItem(sp.bead_names[k])
+                ty.setFlags(ty.flags() & ~Qt.ItemIsEditable)
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                t.setItem(k, 1, ty)
                 names = ""
                 if st and st.aa and st.mapping:
                     names = " ".join(st.aa.atom_names[a] for a in st.mapping.beads[k])
-                t.setItem(k, 2, QTableWidgetItem(names))
+                it = QTableWidgetItem(names)
+                it.setToolTip("Double-click to type the atom names of this bead, separated by "
+                              "spaces or commas")
+                if not (st and st.aa and st.mapping):
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                t.setItem(k, 2, it)
             t.selectRow(self.active_bead)
         t.blockSignals(False)
 

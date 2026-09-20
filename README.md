@@ -100,6 +100,10 @@ revdpd run project.json [--out DIR] [--minimize]     # run a saved project witho
 5. **Back-map system** – writes the files to the output folder and, if enabled, runs
    the LAMMPS minimisation.
 
+The atoms of a bead can also be typed directly into the *Atoms* column of the mapping
+table (names separated by spaces or commas). Sections of the back-mapping panel fold away
+by clicking their title arrow, and the mouse wheel does not change values in the panels.
+
 Mouse: left-drag rotate, Ctrl+left-drag roll, right/middle-drag pan, wheel zoom,
 double-click on empty space resets the view.
 
