@@ -10,7 +10,8 @@ from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QSizePolicy,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
@@ -192,6 +193,12 @@ class MainWindow(QMainWindow):
         self.lbl_aa_title = QLabel("<b>All-atom</b>")
         self.lbl_cg_title = QLabel("<b>Coarse-grained (DPD)</b>")
 
+        for lbl in (self.lbl_aa_title, self.lbl_cg_title):
+            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lbl.setMinimumWidth(1)
+        self.cmb_color.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_color.setMinimumContentsLength(6)
+        self.spn_instance.setMinimumWidth(80)
         aa_panel = QWidget()
         la = QVBoxLayout(aa_panel)
         la.addWidget(_hline(self.lbl_aa_title, 1, self.chk_h, self.chk_aa_labels, self.cmb_color))
@@ -211,8 +218,8 @@ class MainWindow(QMainWindow):
         left = QWidget()
         L = QVBoxLayout(left)
 
-        g1 = QGroupBox("1  CG system (LAMMPS data)")
-        f1 = QFormLayout(g1)
+        g1 = self._section("1  CG system (LAMMPS data)")
+        f1 = QFormLayout(g1.content)
         self.ed_cg = QLineEdit()
         b = QToolButton()
         b.setText("...")
@@ -240,8 +247,8 @@ class MainWindow(QMainWindow):
         f1.addRow(self.tbl_species)
         L.addWidget(g1)
 
-        g2 = QGroupBox("2  All-atom template (moltemplate .lt)")
-        f2 = QFormLayout(g2)
+        g2 = self._section("2  All-atom template (moltemplate .lt)")
+        f2 = QFormLayout(g2.content)
         self.ed_aa = QLineEdit()
         b = QToolButton()
         b.setText("...")
@@ -271,8 +278,8 @@ class MainWindow(QMainWindow):
         f2.addRow(self.lbl_aa_info)
         L.addWidget(g2)
 
-        g3 = QGroupBox("3  Mapping (heavy atoms -> beads)")
-        v3 = QVBoxLayout(g3)
+        g3 = self._section("3  Mapping (heavy atoms -> beads)")
+        v3 = QVBoxLayout(g3.content)
         hint = QLabel("Select a bead (click it in the CG panel, a row below, or press 1-9), then "
                       "click heavy atoms in the all-atom panel. Shift+drag box-selects.")
         hint.setWordWrap(True)
@@ -310,13 +317,16 @@ class MainWindow(QMainWindow):
 
         sa = QScrollArea()
         sa.setWidgetResizable(True)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        sa.setMinimumWidth(180)
         sa.setWidget(left)
         dl = QDockWidget("Setup", self)
         dl.setObjectName("setup")
         dl.setWidget(sa)
         dl.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         self.addDockWidget(Qt.LeftDockWidgetArea, dl)
-        dl.setMinimumWidth(400)
+        dl.setMinimumWidth(200)
+        self.resizeDocks([dl], [400], Qt.Horizontal)
 
         # ---------- right dock: back-mapping
         right = QWidget()
@@ -474,7 +484,13 @@ class MainWindow(QMainWindow):
         self.g_min = QCheckBox("Run it now with LAMMPS")
         self.g_min.setToolTip("Start LAMMPS on the written script as soon as the structure is ready")
         f7.addRow(self.g_min)
-        self.ed_lmp = QLineEdit(self.settings.value("lammps_exe", "") or (find_lammps() or ""))
+        saved_exe = self.settings.value("lammps_exe", "")
+        if saved_exe and not Path(saved_exe).exists():
+            saved_exe = ""                      # remembered from another machine
+        self.ed_lmp = QLineEdit(saved_exe or (find_lammps() or ""))
+        self.ed_lmp.setPlaceholderText("not found - select the LAMMPS executable")
+        self.ed_lmp.setToolTip("Detected automatically from PATH ($LAMMPS_EXE, lmp, lmp_serial, "
+                               "lmp_mpi ...) on this machine")
         b = QToolButton()
         b.setText("...")
         b.clicked.connect(self.browse_lmp)
@@ -528,6 +544,8 @@ class MainWindow(QMainWindow):
         R.addStretch(1)
         sr = QScrollArea()
         sr.setWidgetResizable(True)
+        sr.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        sr.setMinimumWidth(180)
         sr.setWidget(right)
         holder = QWidget()
         hv = QVBoxLayout(holder)
@@ -544,7 +562,8 @@ class MainWindow(QMainWindow):
         dr.setWidget(holder)
         dr.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         self.addDockWidget(Qt.RightDockWidgetArea, dr)
-        dr.setMinimumWidth(330)
+        dr.setMinimumWidth(200)
+        self.resizeDocks([dr], [360], Qt.Horizontal)
 
         # ---------- bottom dock: log
         self.log_box = QPlainTextEdit()
@@ -582,7 +601,50 @@ class MainWindow(QMainWindow):
         self._nowheel = NoWheelFilter(self)
         block_wheel(dl, self._nowheel)        # setup panel
         block_wheel(dr, self._nowheel)        # back-mapping panel
+        for lbl in list(dl.findChildren(QLabel)) + list(dr.findChildren(QLabel)):
+            if lbl.wordWrap():
+                lbl.setMinimumWidth(1)
+                lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._apply_panel_style(dl, dr)
         self.statusBar().showMessage("Load a CG LAMMPS data file to start")
+
+    def _apply_panel_style(self, *docks):
+        """A light, theme-aware style for the side panels: cards with rounded corners."""
+        pal = self.palette()
+        win = pal.window().color()
+        base = pal.base().color()
+        dark = win.lightness() < 128
+        card = base.lighter(104) if not dark else base.lighter(118)
+        panel = win.darker(104) if not dark else win.lighter(106)
+        border = win.darker(118) if not dark else win.lighter(130)
+        text = pal.text().color()
+        css = f"""
+        QScrollArea {{ background: {panel.name()}; border: none; }}
+        QScrollArea > QWidget > QWidget {{ background: {panel.name()}; }}
+        QFrame#sectionContent {{
+            background: {card.name()};
+            border: 1px solid {border.name()};
+            border-radius: 7px;
+            margin-bottom: 2px;
+        }}
+        QToolButton#sectionHeader {{
+            border: none; padding: 3px 4px; color: {text.name()};
+            font-weight: 600; text-align: left;
+        }}
+        QToolButton#sectionHeader:hover {{ color: {pal.highlight().color().name()}; }}
+        CollapsibleGroup > QCheckBox {{ font-weight: 600; }}
+        QTableWidget {{ border: 1px solid {border.name()}; border-radius: 5px; }}
+        QLineEdit {{
+            border: 1px solid {border.name()}; border-radius: 4px; padding: 2px 4px;
+            background: {base.name()};
+        }}
+        QPushButton {{ border: 1px solid {border.name()}; border-radius: 5px; padding: 4px 10px;
+                       background: {card.name()}; }}
+        QPushButton:hover {{ border-color: {pal.highlight().color().name()}; }}
+        QPushButton:disabled {{ color: {pal.mid().color().name()}; }}
+        """
+        for d in docks:
+            d.setStyleSheet(css)
 
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
@@ -1381,8 +1443,14 @@ class MainWindow(QMainWindow):
         self.spn_temp.setValue(o.temperature)
         self.chk_release.setChecked(o.release)
         self.g_min.setChecked(p.minimize.enabled)
-        if p.minimize.lammps_exe:
-            self.ed_lmp.setText(p.minimize.lammps_exe)
+        exe = p.minimize.lammps_exe
+        if exe and not Path(exe).exists():
+            found = find_lammps() or ""
+            self.log(f"LAMMPS executable from the project does not exist here ({exe}); "
+                     + (f"using {found}" if found else "select it in the Relaxation section"))
+            exe = found
+        if exe:
+            self.ed_lmp.setText(exe)
         self.ed_prefix.setText(p.minimize.prefix or (f"mpirun -np {p.minimize.mpi}" if p.minimize.mpi > 1 else ""))
         self.ed_extra.setText(p.minimize.extra_args)
         self.chk_neutral.setChecked(p.ions.neutralize)

@@ -38,6 +38,7 @@ class CollapsibleGroup(QWidget):
         super().__init__(parent)
         self.title = title
         self.arrow = QToolButton()
+        self.arrow.setObjectName("sectionHeader")
         self.arrow.setAutoRaise(True)
         self.arrow.setCheckable(True)
         self.arrow.setChecked(not collapsed)
@@ -57,6 +58,7 @@ class CollapsibleGroup(QWidget):
             self.arrow.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         head.addStretch(1)
         self.content = QFrame()
+        self.content.setObjectName("sectionContent")
         self.content.setFrameShape(QFrame.StyledPanel)
         self.content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         lay = QVBoxLayout(self)

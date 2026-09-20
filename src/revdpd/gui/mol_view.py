@@ -26,7 +26,7 @@ class MoleculeView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(280, 240)
+        self.setMinimumSize(150, 140)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.pos = np.zeros((0, 3))
