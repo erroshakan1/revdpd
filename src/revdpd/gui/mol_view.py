@@ -143,10 +143,17 @@ class MoleculeView(QWidget):
         """A shaded ball: bright specular highlight, body colour, darker rim."""
         base = QColor(c)
         light = QColor(base.lighter(175))
-        dark = QColor(base.darker(int(175 / fog)))
         body = QColor(base.darker(int(105 / fog)))
-        for col, a in ((light, min(255, alpha + 40)), (body, alpha), (dark, alpha)):
-            col.setAlpha(a)
+        dark = QColor(base.darker(int(175 / fog)))
+        if alpha >= 250:
+            light.setAlpha(255)
+            body.setAlpha(255)
+            dark.setAlpha(255)
+        else:
+            # glass-like: clear in the middle, denser towards the rim
+            light.setAlpha(min(255, int(alpha * 0.9)))
+            body.setAlpha(int(alpha * 0.55))
+            dark.setAlpha(min(255, int(alpha * 1.5)))
         g = QRadialGradient(QPointF(x - 0.35 * r, y - 0.4 * r), 1.45 * r)
         g.setColorAt(0.0, light)
         g.setColorAt(0.45, body)
@@ -154,31 +161,39 @@ class MoleculeView(QWidget):
         qp.setBrush(QBrush(g))
         qp.drawEllipse(QPointF(x, y), r, r)
 
-    def _bond(self, qp: QPainter, pa: QPointF, pb: QPointF, ca: QColor, cb: QColor,
-              w: float, fog: float, alpha: int = 255) -> None:
-        """Half-and-half cylinder between two atoms, shaded across its width."""
+    def _half_bond(self, qp: QPainter, pa: QPointF, pb: QPointF, c: QColor, w: float,
+                   fog: float, alpha: int = 255, ra: float = 0.0) -> None:
+        """The half of a bond that belongs to the atom at ``pa``, shaded like a cylinder.
+
+        It starts at the surface of that atom's sphere (radius ``ra`` in pixels), so a bond
+        never paints over the ball it grows out of - which would show through a translucent
+        one. Halves are drawn separately so each is sorted by the depth of its own atom.
+        """
         dx, dy = pb.x() - pa.x(), pb.y() - pa.y()
         length = (dx * dx + dy * dy) ** 0.5
         if length < 1e-6:
             return
-        nx, ny = -dy / length * w, dx / length * w
+        ux, uy = dx / length, dy / length
         mid = QPointF((pa.x() + pb.x()) / 2, (pa.y() + pb.y()) / 2)
+        t = min(ra * 0.92, 0.49 * length)
+        p0 = QPointF(pa.x() + ux * t, pa.y() + uy * t)
+        if (mid.x() - p0.x()) * ux + (mid.y() - p0.y()) * uy <= 0:
+            return                      # the sphere already reaches the middle
+        nx, ny = -uy * w, ux * w
+        body = QColor(c.darker(int(112 / fog)))
+        edge = QColor(c.darker(int(200 / fog)))
+        hi = QColor(c.lighter(150))
+        for col in (body, edge, hi):
+            col.setAlpha(alpha)
+        g = QLinearGradient(p0.x() - nx, p0.y() - ny, p0.x() + nx, p0.y() + ny)
+        g.setColorAt(0.0, edge)
+        g.setColorAt(0.28, hi)
+        g.setColorAt(0.55, body)
+        g.setColorAt(1.0, edge)
         qp.setPen(Qt.NoPen)
-        for p0, c in ((pa, ca), (pb, cb)):
-            body = QColor(c.darker(int(112 / fog)))
-            edge = QColor(c.darker(int(200 / fog)))
-            hi = QColor(c.lighter(150))
-            for col, al in ((body, alpha), (edge, alpha), (hi, alpha)):
-                col.setAlpha(al)
-            g = QLinearGradient(p0.x() - nx, p0.y() - ny, p0.x() + nx, p0.y() + ny)
-            g.setColorAt(0.0, edge)
-            g.setColorAt(0.28, hi)
-            g.setColorAt(0.55, body)
-            g.setColorAt(1.0, edge)
-            quad = QPolygonF([QPointF(p0.x() - nx, p0.y() - ny), QPointF(mid.x() - nx, mid.y() - ny),
-                              QPointF(mid.x() + nx, mid.y() + ny), QPointF(p0.x() + nx, p0.y() + ny)])
-            qp.setBrush(QBrush(g))
-            qp.drawPolygon(quad)
+        qp.setBrush(QBrush(g))
+        qp.drawPolygon(QPolygonF([QPointF(p0.x() - nx, p0.y() - ny), QPointF(mid.x() - nx, mid.y() - ny),
+                                  QPointF(mid.x() + nx, mid.y() + ny), QPointF(p0.x() + nx, p0.y() + ny)]))
 
     def _label(self, qp: QPainter, x: float, y: float, text: str, colour: QColor,
                halo: QColor) -> None:
@@ -214,11 +229,13 @@ class MoleculeView(QWidget):
             items.append((dep[i], 1, int(i)))
         for (a, b) in self.bonds:
             if self.visible[a] and self.visible[b]:
-                items.append(((dep[a] + dep[b]) / 2 - 1e-3, 0, (a, b)))
+                items.append((0.75 * dep[a] + 0.25 * dep[b] - 1e-3, 0, (a, b)))
+                items.append((0.75 * dep[b] + 0.25 * dep[a] - 1e-3, 0, (b, a)))
         if len(self.overlay_pos):
             osc, odep = self._project(self.overlay_pos)
             for a, b in self.overlay_bonds:
-                items.append(((odep[a] + odep[b]) / 2 - 1e-3, 2, (a, b)))
+                items.append((0.75 * odep[a] + 0.25 * odep[b] - 1e-3, 2, (a, b)))
+                items.append((0.75 * odep[b] + 0.25 * odep[a] - 1e-3, 2, (b, a)))
             for k in range(len(self.overlay_pos)):
                 items.append((odep[k], 3, k))
         items.sort(key=lambda t: t[0])
@@ -229,8 +246,9 @@ class MoleculeView(QWidget):
             fog = 0.6 + 0.4 * (z - zmin) / span
             if kind == 0:
                 a, b = d
-                self._bond(qp, QPointF(*scr[a]), QPointF(*scr[b]), self.colors[a], self.colors[b],
-                           bond_w, fog, self.alpha)
+                ra = max(2.0, self.radii[a] * self.zoom)
+                self._half_bond(qp, QPointF(*scr[a]), QPointF(*scr[b]), self.colors[a],
+                                bond_w, fog, min(255, self.alpha + 70), ra)
             elif kind == 1:
                 i = d
                 r = max(2.0, self.radii[i] * self.zoom)
@@ -241,14 +259,14 @@ class MoleculeView(QWidget):
                 elif i == self._hover and self.pickable[i]:
                     qp.setPen(QPen(pal.highlight().color(), 2.0))
                 else:
-                    rim = QColor(self.colors[i].darker(260))
-                    rim.setAlpha(min(255, self.alpha + 30))
-                    qp.setPen(QPen(rim, 0.8))
+                    rim = QColor(self.colors[i].darker(230))
+                    rim.setAlpha(255 if self.alpha >= 250 else min(255, self.alpha + 80))
+                    qp.setPen(QPen(rim, 0.8 if self.alpha >= 250 else 1.2))
                 self._sphere(qp, x, y, r, self.colors[i], fog, self.alpha)
             elif kind == 2:
                 a, b = d
-                self._bond(qp, QPointF(*osc[a]), QPointF(*osc[b]), self.overlay_colors[a],
-                           self.overlay_colors[b], 0.55 * ov_r, fog)
+                self._half_bond(qp, QPointF(*osc[a]), QPointF(*osc[b]), self.overlay_colors[a],
+                                0.55 * ov_r, fog, 255, ov_r)
             else:
                 k = d
                 qp.setPen(Qt.NoPen)

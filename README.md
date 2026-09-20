@@ -27,7 +27,8 @@ Optionally it removes overlaps and minimises the result with LAMMPS.
   heavy atoms on the all-atom side. Hydrogens follow their heavy atom. An *Auto (chain)*
   proposal is available for chain-like molecules.
 - Live preview of the fitted molecule on top of any CG molecule of the species; the CG
-  beads turn translucent so the all-atom structure inside them stays visible.
+  beads are drawn translucent (*Translucent*), so the all-atom structure inside them
+  and beads behind them stay visible.
 - Scale (Å per DPD length unit) can be estimated from the template and CG bond lengths.
 - Placement by **Kabsch** fit of bead centres, in three modes: *rigid* template,
   *rigid + per-bead shift*, and **per-bead fragments** (every bead's atom group is aligned

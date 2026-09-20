@@ -176,6 +176,9 @@ class MainWindow(QMainWindow):
         self.cmb_color.addItems(["Color: mapping", "Color: element"])
         self.chk_cg_labels = QCheckBox("Labels")
         self.chk_cg_labels.setChecked(True)
+        self.chk_trans = QCheckBox("Translucent")
+        self.chk_trans.setToolTip("Draw the CG beads semi-transparent")
+        self.chk_trans.setChecked(True)
         self.chk_overlay = QCheckBox("Overlay fit")
         self.chk_overlay.setToolTip("Show the all-atom template fitted onto this CG molecule")
         self.chk_overlay.setChecked(True)
@@ -193,7 +196,7 @@ class MainWindow(QMainWindow):
         la.addWidget(self.aa_view, 1)
         cg_panel = QWidget()
         lc = QVBoxLayout(cg_panel)
-        lc.addWidget(_hline(self.lbl_cg_title, 1, self.chk_cg_labels, self.chk_overlay,
+        lc.addWidget(_hline(self.lbl_cg_title, 1, self.chk_cg_labels, self.chk_trans, self.chk_overlay,
                             self.spn_instance, self.btn_rand_inst))
         lc.addWidget(self.cg_view, 1)
         split = QSplitter(Qt.Horizontal)
@@ -551,6 +554,7 @@ class MainWindow(QMainWindow):
         self.chk_cg_labels.toggled.connect(self.cg_view.set_show_labels)
         self.cg_view.set_show_labels(True)
         self.chk_overlay.toggled.connect(lambda: self.refresh_cg(reset=False))
+        self.chk_trans.toggled.connect(lambda: self.refresh_cg(reset=False))
         self.spn_instance.valueChanged.connect(lambda: self.refresh_cg(reset=True))
         self.btn_rand_inst.clicked.connect(self.random_instance)
         for w in (self.spn_scale, self.spn_flex):
@@ -1075,7 +1079,10 @@ class MainWindow(QMainWindow):
         overlay = bool(self.chk_overlay.isChecked() and st and st.aa and st.mapping
                        and (len(st.mapping.mapped_beads()) >= 2 or st.copies > 1))
         cols = [QColor(BEAD_COLORS[b % len(BEAD_COLORS)]) for b in range(sp.n_beads)]
-        self.cg_view.set_alpha(150 if overlay else 255)
+        if self.chk_trans.isChecked():
+            self.cg_view.set_alpha(120 if overlay else 165)
+        else:
+            self.cg_view.set_alpha(255)
         labels = [f"{b + 1}:{n}" for b, n in enumerate(sp.bead_names)]
         if reset or len(self.cg_view.pos) != sp.n_beads:
             self.cg_view.set_molecule(x, np.full(sp.n_beads, r), cols, sp.bonds, labels, reset_view=True)
