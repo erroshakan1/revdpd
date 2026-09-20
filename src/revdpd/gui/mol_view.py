@@ -200,7 +200,7 @@ class MoleculeView(QWidget):
         """Text with a halo so it stays readable on top of atoms."""
         path = QPainterPath()
         path.addText(QPointF(x, y), qp.font(), text)
-        qp.setPen(QPen(halo, 3.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        qp.setPen(QPen(halo, 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         qp.setBrush(Qt.NoBrush)
         qp.drawPath(path)
         qp.setPen(Qt.NoPen)
@@ -274,8 +274,7 @@ class MoleculeView(QWidget):
         # labels
         if self.show_labels or self._hover >= 0:
             f = QFont(self.font())
-            f.setPointSizeF(max(7.5, min(12.0, 0.32 * self.zoom)))
-            f.setBold(True)
+            f.setPointSizeF(max(7.0, min(10.0, 0.28 * self.zoom)))
             qp.setFont(f)
             halo = QColor(pal.base().color())
             halo.setAlpha(220)
