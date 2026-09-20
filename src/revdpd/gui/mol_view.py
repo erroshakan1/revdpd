@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QRadialGradient
+from PySide6.QtGui import (QBrush, QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen,
+                           QPolygonF, QRadialGradient)
 from PySide6.QtWidgets import QWidget
 
 
@@ -43,6 +44,7 @@ class MoleculeView(QWidget):
         self.overlay_radius = 0.3
         self.placeholder = "Nothing loaded"
         self.info_text = ""
+        self.alpha = 255          # opacity of the atoms/beads (translucent CG beads: ~150)
         self.rot = np.eye(3)
         self.center = np.zeros(3)
         self.zoom = 20.0
@@ -94,6 +96,11 @@ class MoleculeView(QWidget):
         self.overlay_radius = radius
         self.update()
 
+    def set_alpha(self, alpha: int):
+        """Opacity of the spheres and bonds (0-255); translucency reveals an overlay."""
+        self.alpha = int(alpha)
+        self.update()
+
     def set_info(self, text: str):
         self.info_text = text
         self.update()
@@ -131,11 +138,69 @@ class MoleculeView(QWidget):
         return np.stack([sx, sy], 1), p[:, 2]
 
     # ---------------------------------------------------------------- paint
+    def _sphere(self, qp: QPainter, x: float, y: float, r: float, c: QColor, fog: float,
+                alpha: int = 255) -> None:
+        """A shaded ball: bright specular highlight, body colour, darker rim."""
+        base = QColor(c)
+        light = QColor(base.lighter(175))
+        dark = QColor(base.darker(int(175 / fog)))
+        body = QColor(base.darker(int(105 / fog)))
+        for col, a in ((light, min(255, alpha + 40)), (body, alpha), (dark, alpha)):
+            col.setAlpha(a)
+        g = QRadialGradient(QPointF(x - 0.35 * r, y - 0.4 * r), 1.45 * r)
+        g.setColorAt(0.0, light)
+        g.setColorAt(0.45, body)
+        g.setColorAt(1.0, dark)
+        qp.setBrush(QBrush(g))
+        qp.drawEllipse(QPointF(x, y), r, r)
+
+    def _bond(self, qp: QPainter, pa: QPointF, pb: QPointF, ca: QColor, cb: QColor,
+              w: float, fog: float, alpha: int = 255) -> None:
+        """Half-and-half cylinder between two atoms, shaded across its width."""
+        dx, dy = pb.x() - pa.x(), pb.y() - pa.y()
+        length = (dx * dx + dy * dy) ** 0.5
+        if length < 1e-6:
+            return
+        nx, ny = -dy / length * w, dx / length * w
+        mid = QPointF((pa.x() + pb.x()) / 2, (pa.y() + pb.y()) / 2)
+        qp.setPen(Qt.NoPen)
+        for p0, c in ((pa, ca), (pb, cb)):
+            body = QColor(c.darker(int(112 / fog)))
+            edge = QColor(c.darker(int(200 / fog)))
+            hi = QColor(c.lighter(150))
+            for col, al in ((body, alpha), (edge, alpha), (hi, alpha)):
+                col.setAlpha(al)
+            g = QLinearGradient(p0.x() - nx, p0.y() - ny, p0.x() + nx, p0.y() + ny)
+            g.setColorAt(0.0, edge)
+            g.setColorAt(0.28, hi)
+            g.setColorAt(0.55, body)
+            g.setColorAt(1.0, edge)
+            quad = QPolygonF([QPointF(p0.x() - nx, p0.y() - ny), QPointF(mid.x() - nx, mid.y() - ny),
+                              QPointF(mid.x() + nx, mid.y() + ny), QPointF(p0.x() + nx, p0.y() + ny)])
+            qp.setBrush(QBrush(g))
+            qp.drawPolygon(quad)
+
+    def _label(self, qp: QPainter, x: float, y: float, text: str, colour: QColor,
+               halo: QColor) -> None:
+        """Text with a halo so it stays readable on top of atoms."""
+        path = QPainterPath()
+        path.addText(QPointF(x, y), qp.font(), text)
+        qp.setPen(QPen(halo, 3.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        qp.setBrush(Qt.NoBrush)
+        qp.drawPath(path)
+        qp.setPen(Qt.NoPen)
+        qp.setBrush(colour)
+        qp.drawPath(path)
+
     def paintEvent(self, _ev):
         qp = QPainter(self)
         qp.setRenderHint(QPainter.Antialiasing)
         pal = self.palette()
-        qp.fillRect(self.rect(), pal.base())
+        base = pal.base().color()
+        bg = QLinearGradient(0, 0, 0, self.height())
+        bg.setColorAt(0.0, base.lighter(103) if base.lightness() > 127 else base.lighter(130))
+        bg.setColorAt(1.0, base.darker(107) if base.lightness() > 127 else base.darker(105))
+        qp.fillRect(self.rect(), QBrush(bg))
         if len(self.pos) == 0:
             qp.setPen(pal.placeholderText().color())
             qp.drawText(self.rect(), Qt.AlignCenter, self.placeholder)
@@ -150,65 +215,63 @@ class MoleculeView(QWidget):
         for (a, b) in self.bonds:
             if self.visible[a] and self.visible[b]:
                 items.append(((dep[a] + dep[b]) / 2 - 1e-3, 0, (a, b)))
+        if len(self.overlay_pos):
+            osc, odep = self._project(self.overlay_pos)
+            for a, b in self.overlay_bonds:
+                items.append(((odep[a] + odep[b]) / 2 - 1e-3, 2, (a, b)))
+            for k in range(len(self.overlay_pos)):
+                items.append((odep[k], 3, k))
         items.sort(key=lambda t: t[0])
-        bond_w = max(1.5, 0.16 * self.zoom)
+        # bond radius follows the spheres, so it looks the same at any zoom level
+        bond_w = max(1.0, 0.30 * float(np.median(self.radii)) * self.zoom)
+        ov_r = max(1.5, self.overlay_radius * self.zoom)
         for z, kind, d in items:
-            fog = 0.55 + 0.45 * (z - zmin) / span
+            fog = 0.6 + 0.4 * (z - zmin) / span
             if kind == 0:
                 a, b = d
-                pa, pb = QPointF(*scr[a]), QPointF(*scr[b])
-                mid = (pa + pb) / 2
-                for p0, c in ((pa, self.colors[a]), (pb, self.colors[b])):
-                    pen = QPen(c.darker(int(100 / fog)), bond_w, Qt.SolidLine, Qt.RoundCap)
-                    qp.setPen(pen)
-                    qp.drawLine(p0, mid)
-            else:
+                self._bond(qp, QPointF(*scr[a]), QPointF(*scr[b]), self.colors[a], self.colors[b],
+                           bond_w, fog, self.alpha)
+            elif kind == 1:
                 i = d
                 r = max(2.0, self.radii[i] * self.zoom)
-                c = self.colors[i]
-                cx, cy = scr[i]
-                g = QRadialGradient(QPointF(cx - r / 3, cy - r / 3), r * 1.3)
-                g.setColorAt(0, c.lighter(160))
-                g.setColorAt(0.5, c.darker(int(100 / fog)))
-                g.setColorAt(1, c.darker(int(190 / fog)))
-                qp.setBrush(g)
+                x, y = scr[i]
                 ring = self.rings.get(i)
                 if ring is not None:
                     qp.setPen(QPen(ring, max(2.5, min(5.0, 0.15 * r))))
                 elif i == self._hover and self.pickable[i]:
                     qp.setPen(QPen(pal.highlight().color(), 2.0))
                 else:
-                    qp.setPen(QPen(c.darker(250), 0.8))
-                qp.drawEllipse(QPointF(cx, cy), r, r)
-        # overlay (e.g. fitted all-atom structure drawn over CG beads)
-        if len(self.overlay_pos):
-            osc, _ = self._project(self.overlay_pos)
-            for a, b in self.overlay_bonds:
-                qp.setPen(QPen(QColor(40, 40, 40, 170), max(1.0, 0.6 * self.overlay_radius * self.zoom)))
-                qp.drawLine(QPointF(*osc[a]), QPointF(*osc[b]))
-            qp.setPen(Qt.NoPen)
-            r = max(1.5, self.overlay_radius * self.zoom)
-            for k, (x, y) in enumerate(osc):
-                c = QColor(self.overlay_colors[k])
-                c.setAlpha(210)
-                qp.setBrush(c)
-                qp.drawEllipse(QPointF(x, y), r, r)
+                    rim = QColor(self.colors[i].darker(260))
+                    rim.setAlpha(min(255, self.alpha + 30))
+                    qp.setPen(QPen(rim, 0.8))
+                self._sphere(qp, x, y, r, self.colors[i], fog, self.alpha)
+            elif kind == 2:
+                a, b = d
+                self._bond(qp, QPointF(*osc[a]), QPointF(*osc[b]), self.overlay_colors[a],
+                           self.overlay_colors[b], 0.55 * ov_r, fog)
+            else:
+                k = d
+                qp.setPen(Qt.NoPen)
+                self._sphere(qp, osc[k, 0], osc[k, 1], ov_r, self.overlay_colors[k], fog)
         # labels
         if self.show_labels or self._hover >= 0:
             f = QFont(self.font())
-            f.setPointSizeF(max(7.0, min(11.0, 0.35 * self.zoom)))
+            f.setPointSizeF(max(7.5, min(12.0, 0.32 * self.zoom)))
+            f.setBold(True)
             qp.setFont(f)
+            halo = QColor(pal.base().color())
+            halo.setAlpha(220)
             idx = np.flatnonzero(self.visible) if self.show_labels else [self._hover]
             for i in idx:
                 if not self.show_labels and not self.visible[i]:
                     continue
                 r = self.radii[i] * self.zoom
                 x, y = scr[i]
-                qp.setPen(pal.text().color())
-                qp.drawText(QPointF(x + r * 0.7, y - r * 0.7), self.labels[i])
+                self._label(qp, x + r * 0.7, y - r * 0.7, self.labels[i], pal.text().color(), halo)
         if self.info_text:
             qp.setFont(self.font())
             qp.setPen(pal.placeholderText().color())
+            qp.setBrush(Qt.NoBrush)
             qp.drawText(self.rect().adjusted(8, 0, -8, -6), Qt.AlignLeft | Qt.AlignBottom, self.info_text)
         if self._band is not None:
             qp.setPen(QPen(pal.highlight().color(), 1, Qt.DashLine))

@@ -1074,12 +1074,8 @@ class MainWindow(QMainWindow):
         st = self.state
         overlay = bool(self.chk_overlay.isChecked() and st and st.aa and st.mapping
                        and (len(st.mapping.mapped_beads()) >= 2 or st.copies > 1))
-        cols = []
-        for b in range(sp.n_beads):
-            c = QColor(BEAD_COLORS[b % len(BEAD_COLORS)])
-            if overlay:
-                c.setAlpha(90)
-            cols.append(c)
+        cols = [QColor(BEAD_COLORS[b % len(BEAD_COLORS)]) for b in range(sp.n_beads)]
+        self.cg_view.set_alpha(150 if overlay else 255)
         labels = [f"{b + 1}:{n}" for b, n in enumerate(sp.bead_names)]
         if reset or len(self.cg_view.pos) != sp.n_beads:
             self.cg_view.set_molecule(x, np.full(sp.n_beads, r), cols, sp.bonds, labels, reset_view=True)
